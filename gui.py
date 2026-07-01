@@ -1,0 +1,516 @@
+"""AI Minesweeper GUI.
+
+Layout:
+  Left  : minesweeper board canvas + status bar + control buttons
+  Right : scrollable panel showing the LLM's thinking and actions
+
+The LLM runs in a background thread. The board is updated on the main thread
+via a thread-safe command queue. A move delay between turns lets the user
+follow what the model is doing.
+"""
+import ctypes
+import json
+import queue
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, font as tkfont
+
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+from minesweeper import Minesweeper, DIFFICULTIES, NUMBER_COLORS
+from llm_client import LLMClient, LLMError
+
+UI_FONT_SIZE = 14
+THINK_FONT_SIZE = 14
+BOARD_TEXT_FONT = "Consolas"
+
+
+CONFIG_PATH = "llm_config.json"
+
+SYSTEM_PROMPT = """你正在玩一个经典的扫雷游戏。棋盘是一个二维网格，其中隐藏着若干地雷。
+
+你的目标:翻开全部不是雷的格子而不踩到任何一颗雷即可获胜。
+
+坐标系:行(row)与列(col)均从 0 开始，左上角为 (0,0)。
+
+棋盘字符含义(每次都将提供当前完整棋盘文本):
+  '.'  未翻开格子(内容未知)
+  'F'  你插旗标记的格子(你认为可能是雷)
+  0-8  已翻开数字格，表示其周围8个相邻格中的雷数
+  '*'  地雷(仅在你踩雷输掉、或获胜时才出现)
+
+可用工具(函数调用):
+- reveal(row, col) : 翻开一个格子。
+    * 若是雷 => 游戏失败(输)。
+    * 若是数字格 => 显示周围8格雷数。
+    * 若是 0 格 => 自动连锁展开相邻连续安全区域。
+- toggle_flag(row, col) : 切换未翻开格子的插旗状态(标记/取消标记你认为是雷的格子)。
+- chord(row, col) : 对一个已翻开的数字格执行双击。当该数字格周围已插旗数 == 该数字时，会一次性翻开其周围所有未翻开且未插旗的格子。若你标记的雷有误，双击会踩雷导致失败(与人类双击同样规则)。这能一步推进多个安全格。
+    * 若某个数字格周围已插旗数已经等于该数字，且周围仍有未翻开未插旗格，通常应优先考虑 chord，因为它比逐个 reveal 更高效。
+    * 但 chord 不是强制动作；如果你怀疑旗标可能来自不确定猜测，或认为单格 reveal 更稳妥，可以选择 reveal。
+辅助机制(程序自动处理，你无需重复推理):
+- **确定性自动插旗**: 每次翻开新区域后，若某个已翻开数字 N 所在格周围，"未翻开格数 + 已插旗数 == N"，程序会自动为这些未翻开格插旗(它们必然是雷)。结果会直接反映在棋盘文本的 'F' 中，你无需再推理它们，节省你的精力与 token。
+- **首点保护**: 你的第一步 reveal 永远不会踩雷(其周围3x3区域无雷)。请放心选择中心附近作为首点。
+
+策略建议(请默默遵循，不必每次复述):
+1. 优先翻开数字周围已可推断为安全的格子(已满足雷数约束)。当某个数字格周围的已插旗数 == 该数字，且周围还有未翻开未插旗格时，优先考虑对该数字格使用 chord，以便一次性展开多个确定安全格；若旗标来源不够可靠或局面复杂，也可以改为逐个 reveal。
+2. 数字 N 周围若恰好有 N 个未翻开格，且其余邻居已确认安全，则这些未翻开格可能是雷 -> 插旗。
+3. 当没有任何确定信息时，未知格应优先翻开周围雷数约束最松的部分；尽量避免从数字较大的区域向外硬猜。
+4. 运用数学/逻辑推理;只有纯逻辑无法推进时才允许概率猜测，并简短说明你的胜算理由。
+
+输出要求:
+- 每回合必须用工具调用执行一步动作，不能只分析、总结或列计划。
+- 一次只执行一个工具调用。工具结果返回后进入下一回合。
+- 若你没有执行工具调用，程序会记为一次"无动作"；连续多次无动作会自动停止本局。
+- 如果已经找到安全格或确定雷格，请立刻调用 reveal / toggle_flag / chord，不要继续展开额外分析。
+- 当存在明显安全的 chord 机会时，优先使用 chord 来提高推进效率；但不要为了使用 chord 而冒险双击不可靠的旗标。
+- 请保持思考简明扼要(通常几句话即可)，不要长篇大论。
+- 请尽量使用简体中文向用户说明你的思考。
+- 你看到的"棋盘"文本里坐标以列编号和行编号为准，务必对准。
+"""
+
+
+def load_config(path=CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("AI 扫雷 - LLM 自动玩")
+        self.cfg = load_config()
+        self.cell_size = self.cfg.get("cell_size", 32)
+        self.move_delay = self.cfg.get("move_delay", 0.6)
+        self.keep_recent = self.cfg.get("keep_recent_turns", 30)
+        self.max_no_action = self.cfg.get("max_no_action_retries", 3)
+
+        self._apply_fonts()
+
+        self.difficulty_var = tk.StringVar(value="beginner")
+        self.seed_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="点击\"开始/重启\"开始一局")
+        self.thinking_status_var = tk.StringVar(value="空闲")
+        self.running = False
+
+        self._build_layout()
+        self.game = None
+        self.client = None
+        self.cmd_queue = queue.Queue()
+        self.worker = None
+
+    def _apply_fonts(self):
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(size=UI_FONT_SIZE)
+            except Exception:
+                pass
+
+    # -------------------------- UI -------------------------- #
+    def _build_layout(self):
+        top = ttk.Frame(self.root)
+        top.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
+
+        ttk.Label(top, text="难度:").pack(side=tk.LEFT)
+        for name in DIFFICULTIES:
+            ttk.Radiobutton(top, text=name, value=name,
+                            variable=self.difficulty_var).pack(side=tk.LEFT)
+        ttk.Label(top, text="种子(可空):").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Entry(top, textvariable=self.seed_var, width=8).pack(side=tk.LEFT)
+
+        self.start_btn = ttk.Button(top, text="开始/重启", command=self.on_start)
+        self.start_btn.pack(side=tk.LEFT, padx=8)
+        self.stop_btn = ttk.Button(top, text="停止", command=self.on_stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT)
+        self.continue_btn = ttk.Button(top, text="继续", command=self.on_continue, state=tk.DISABLED)
+        self.continue_btn.pack(side=tk.LEFT, padx=8)
+        self.edit_btn = ttk.Button(top, text="编辑配置", command=self.on_edit_config)
+        self.edit_btn.pack(side=tk.LEFT, padx=8)
+
+        body = ttk.Frame(self.root)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        # Left: board
+        left = ttk.Frame(body)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)
+        self.canvas = tk.Canvas(left, bg="#bdbdbd", highlightthickness=0)
+        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        status = ttk.Frame(left)
+        status.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT)
+
+        # Right: thinking panel
+        right = ttk.Frame(body)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        ttk.Label(right, text="LLM 思考过程").pack(anchor="w")
+        self.thinking_status = ttk.Label(right, textvariable=self.thinking_status_var,
+                                         font=(None, UI_FONT_SIZE, "bold"))
+        self.thinking_status.pack(anchor="w")
+        self.thinking = tk.Text(right, wrap=tk.WORD, state=tk.DISABLED,
+                                bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
+                                font=(BOARD_TEXT_FONT, THINK_FONT_SIZE))
+        self.thinking.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(right, command=self.thinking.yview)
+        sb.pack(side=tk.LEFT, fill=tk.Y)
+        self.thinking.config(yscrollcommand=sb.set)
+
+    # -------------------------- lifecycle -------------------------- #
+    def on_start(self):
+        if self.running:
+            return
+        seed = self.seed_var.get().strip()
+        seed = int(seed) if seed else None
+        self.game = Minesweeper.from_preset(self.difficulty_var.get(), seed=seed)
+        try:
+            self.client = LLMClient(self.cfg)
+        except LLMError as e:
+            messagebox.showerror("配置错误", str(e))
+            return
+        self.client.reset(SYSTEM_PROMPT + "\n\n当前难度: " + self.difficulty_var.get() +
+                           f"\n棋盘尺寸: {self.game.width}x{self.game.height}, " +
+                           f"雷数: {self.game.num_mines}")
+
+        self._clear_thinking()
+        self._append_text(f"=== 新游戏开始: {self.difficulty_var.get()} " +
+                          f"{self.game.width}x{self.game.height} 雷 {self.game.num_mines} ===\n",
+                          tag="sys")
+        self._draw_board()
+        self._update_status()
+        self._begin_worker()
+
+    def on_continue(self):
+        if self.running:
+            return
+        if self.game is None or self.game.state in ("won", "lost", "ready") or self.client is None:
+            return
+        self._append_text("\n[继续]\n", tag="sys")
+        self._begin_worker()
+
+    def _begin_worker(self):
+        self.running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.continue_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        while not self.cmd_queue.empty():
+            try:
+                self.cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.worker = threading.Thread(target=self._run_loop, daemon=True)
+        self.worker.start()
+        self.root.after(100, self._poll_queue)
+
+    def on_stop(self):
+        self.running = False
+        self.thinking_status_var.set("空闲")
+        self._append_text("\n[已停止]\n", tag="sys")
+        # stop permits continue; new game still allowed
+        self.stop_btn.config(state=tk.DISABLED)
+        if self.game is not None and self.game.state == "playing":
+            self.continue_btn.config(state=tk.NORMAL)
+        self.start_btn.config(state=tk.NORMAL)
+
+    def on_edit_config(self):
+        path = filedialog.askopenfilename(
+            initialdir=".", filetypes=[("JSON", "*.json"), ("All", "*.*")],
+            title="选择 llm_config.json")
+        if not path:
+            return
+        try:
+            self.cfg = load_config(path)
+        except Exception as e:
+            messagebox.showerror("读取失败", str(e))
+            return
+        self.move_delay = self.cfg.get("move_delay", self.move_delay)
+        self.keep_recent = self.cfg.get("keep_recent_turns", self.keep_recent)
+        messagebox.showinfo("已加载", f"配置已加载:\n{path}")
+
+    # -------------------------- drawing -------------------------- #
+    def _draw_board(self):
+        g = self.game
+        cs = self.cell_size
+        self.canvas.delete("all")
+        w = g.width * cs
+        h = g.height * cs
+        self.canvas.config(width=w, height=h, scrollregion=(0, 0, w, h))
+        for r in range(g.height):
+            for c in range(g.width):
+                x0, y0 = c * cs, r * cs
+                x1, y1 = x0 + cs, y0 + cs
+                if g.revealed[r][c]:
+                    color = "#d0d0d0" if not g.mines[r][c] else "#ff7777"
+                    self.canvas.create_rectangle(x0, y0, x1, y1, fill=color,
+                                                 outline="#9a9a9a")
+                    sym = g.cell_symbol(r, c)
+                    if sym == "*":
+                        self.canvas.create_text((x0+x1)/2, (y0+y1)/2,
+                                                text="\U0001F4A3", font=("Arial", int(cs*0.6)))
+                    elif sym != "0":
+                        self.canvas.create_text((x0+x1)/2, (y0+y1)/2, text=sym,
+                                                fill=NUMBER_COLORS.get(int(sym), "#000"),
+                                                font=("Consolas", int(cs*0.55), "bold"))
+                else:
+                    self.canvas.create_rectangle(x0, y0, x1, y1, fill="#bdbdbd",
+                                                 outline="#9a9a9a")
+                    if g.flagged[r][c]:
+                        self.canvas.create_text((x0+x1)/2, (y0+y1)/2,
+                                                text="\U0001F6A9", font=("Arial", int(cs*0.55)))
+        if g.explode_cell:
+            er, ec = g.explode_cell
+            x0, y0 = ec*cs, er*cs
+            self.canvas.create_rectangle(x0, y0, x0+cs, y0+cs, outline="red", width=3)
+
+    def _update_status(self):
+        g = self.game
+        state_text = {"ready": "就绪", "playing": "进行中",
+                      "won": "胜利!", "lost": "失败(踩雷)"}[g.state]
+        self.status_var.set(
+            f"{self.difficulty_var.get()} | {g.width}x{g.height} 雷 {g.num_mines} | "
+            f"翻开 {g.revealed_count} | 状态: {state_text}"
+        )
+
+    # -------------------------- thinking panel -------------------------- #
+    def _clear_thinking(self):
+        self.thinking.config(state=tk.NORMAL)
+        self.thinking.delete("1.0", tk.END)
+        self.thinking.config(state=tk.DISABLED)
+
+    def _append_text(self, text, tag=None):
+        self.thinking.config(state=tk.NORMAL)
+        if tag:
+            self.thinking.insert(tk.END, text, tag)
+        else:
+            self.thinking.insert(tk.END, text)
+        self.thinking.see(tk.END)
+        self.thinking.config(state=tk.DISABLED)
+
+    # -------------------------- main thread poller -------------------------- #
+    def _poll_queue(self):
+        if not self.running and self.cmd_queue.empty():
+            return
+        try:
+            while True:
+                kind, payload = self.cmd_queue.get_nowait()
+                self._handle_cmd(kind, payload)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
+
+    def _handle_cmd(self, kind, payload):
+        if kind == "think_start":
+            self.thinking_status_var.set("思考中...")
+        elif kind == "think_chunk":
+            self._append_text(payload, tag="think")
+        elif kind == "think_end":
+            self.thinking_status_var.set("空闲")
+            if payload:
+                self._append_text("\n", tag="think")
+        elif kind == "thinking":
+            self._append_text(payload + "\n", tag="think")
+        elif kind == "action":
+            self._append_text(payload + "\n", tag="act")
+        elif kind == "result":
+            self._append_text(payload + "\n", tag="res")
+        elif kind == "error":
+            self._append_text(payload + "\n", tag="err")
+        elif kind == "redraw":
+            self._draw_board()
+            self._update_status()
+        elif kind == "end":
+            self.running = False
+            self.thinking_status_var.set("游戏结束")
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.continue_btn.config(state=tk.DISABLED)
+            self._draw_board()
+            self._update_status()
+
+    # -------------------------- LLM worker thread -------------------------- #
+    def _run_loop(self):
+        no_action = 0
+        while self.running:
+            g = self.game
+            if g.state in ("won", "lost"):
+                self._put("end", None)
+                return
+            remaining = max(self.max_no_action - no_action, 1)
+            urgency = (
+                f"\n\n运行约束: 本轮必须调用且只调用一个工具。"
+                f"如果本轮不调用工具，将记为无动作；连续 {self.max_no_action} "
+                f"次无动作会自动停止本局。当前已连续无动作 {no_action} 次，"
+                f"本轮再无动作前剩余机会 {remaining} 次。"
+                "请用简体中文简短说明，然后立即调用 reveal / toggle_flag / chord。"
+            )
+            snapshot = (
+                "当前棋盘（row 为行，col 为列；从0开始；'.' 未翻开, 'F' 旗, 数字为已翻开雷数）:\n"
+                + g.to_text() + "\n" + g.summary() + urgency
+            )
+            self._put("think_start", None)
+            thinking = ""
+            tool_calls = []
+            try:
+                for kind, val in self.client.turn_stream(snapshot):
+                    if not self.running:
+                        self._put("think_end", None)
+                        return
+                    if kind == "chunk":
+                        self._put("think_chunk", val)
+                        thinking += val
+                    elif kind == "final":
+                        thinking = val.get("thinking", thinking)
+                        tool_calls = val.get("tool_calls") or []
+            except LLMError as e:
+                self._put("think_end", True)
+                self._put("error", f"[LLM 调用失败] {e}")
+                self._put("end", None)
+                return
+            self._put("think_end", True)
+            # newline after the streamed thinking block
+            self._put("think_chunk", "\n")
+
+            if not tool_calls:
+                no_action += 1
+                self._put(
+                    "result",
+                    f"[模型未执行任何工具调用] 连续无动作 {no_action}/{self.max_no_action}",
+                )
+                if no_action >= self.max_no_action:
+                    self._put("error", "连续多次未执行动作，自动停止。")
+                    self._put("end", None)
+                    return
+                continue
+            no_action = 0
+            for tc in tool_calls:
+                if not self.running:
+                    return
+                name = tc.get("name")
+                args = tc.get("args") or {}
+                row = args.get("row")
+                col = args.get("col")
+                if row is None or col is None:
+                    self.client.add_tool_result(tc.get("id"), name or "unknown",
+                                               "错误: 缺少 row 或 col 参数。")
+                    self._put("result", "[跳过: 缺少参数]")
+                    continue
+                self._put("action", f">>> {name}(row={row}, col={col})")
+                if name == "reveal":
+                    out = g.reveal(row, col)
+                    # auto-flag determined mines after a reveal
+                    autoflags = g.auto_flag_certain_mines()
+                elif name == "toggle_flag":
+                    out = g.toggle_flag(row, col)
+                    autoflags = []
+                elif name == "chord":
+                    out = g.chord(row, col)
+                    # A successful chord can expose new numbered cells, which
+                    # may in turn make additional mines certain.
+                    autoflags = g.auto_flag_certain_mines()
+                else:
+                    out = {"result": "invalid", "message": f"未知函数: {name}"}
+                    autoflags = []
+                self._put("redraw", None)
+                self._put("result", self._format_tool_result(out, name, row, col))
+                if autoflags:
+                    cell_strs = ", ".join(f"({r},{c})" for r, c in autoflags)
+                    self._put("result", f"  [自动插旗] {len(autoflags)} 格: {cell_strs}")
+                self.client.add_tool_result(
+                    tc.get("id"), name,
+                    self._tool_result_to_llm(out, name, row, col, autoflags))
+                if g.state in ("won", "lost"):
+                    self._put("end", None)
+                    return
+                self.client.trim_history(self.keep_recent)
+                time.sleep(self.move_delay)
+
+    @staticmethod
+    def _format_tool_result(out, name, row, col):
+        r = out.get("result")
+        if r == "safe":
+            n = len(out.get("cells", []))
+            if name == "chord":
+                return f"  -> 双击 ({row},{col}) 成功, 展开 {n} 格"
+            return f"  -> 翻开 ({row},{col}) 成功, 展开 {n} 格"
+        if r == "mine":
+            if name == "chord":
+                cell = out.get("cell", (row, col))
+                return f"  -> 双击踩雷! {cell} 游戏失败"
+            return f"  -> 踩雷! ({row},{col}) 游戏失败"
+        if r == "won":
+            return "  -> 胜利! 已翻开全部安全格"
+        if r == "flag":
+            return f"  -> 已在 ({row},{col}) 插旗"
+        if r == "unflag":
+            return f"  -> 已取消 ({row},{col}) 的旗"
+        if r == "nochange":
+            return f"  -> 无变化: {out.get('message','')}"
+        if r == "invalid":
+            return f"  -> 无效: {out.get('message','')}"
+        if r == "over":
+            return f"  -> 游戏已结束: {out.get('message','')}"
+        return f"  -> {out}"
+
+    @staticmethod
+    def _tool_result_to_llm(out, name, row, col, autoflags=None):
+        autoflags = autoflags or []
+        extra = ""
+        if autoflags:
+            extra = f" 程序已为 {len(autoflags)} 个确定雷格自动插旗(见快照中的 'F')。"
+        r = out.get("result")
+        if r == "safe":
+            verb = "双击" if name == "chord" else "翻开"
+            return (f"{name}({row},{col}) 成功。{verb}后新打开了 "
+                    f"{len(out.get('cells',[]))} 个格，棋盘已更新(见下次给你的快照)。"
+                    + extra)
+        if r == "mine":
+            cell = out.get("cell", (row, col))
+            return f"{name}({row},{col}) 触发了地雷 {cell}, 你输了这局。"
+        if r == "won":
+            return f"{name}({row},{col}) 之后你已胜利(翻开全部安全格)。"
+        if r == "flag":
+            return f"toggle_flag({row},{col}) 已标记为旗。"
+        if r == "unflag":
+            return f"toggle_flag({row},{col}) 已取消旗。"
+        if r == "nochange":
+            return f"{name}({row},{col}) 无变化: {out.get('message','')}"
+        if r == "invalid":
+            return f"{name}({row},{col}) 无效: {out.get('message','')}"
+        return str(out)
+
+    def _put(self, kind, payload):
+        self.cmd_queue.put((kind, payload))
+
+
+def main():
+    root = tk.Tk()
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        root.tk.call("tk", "scaling", dpi / 72.0)
+    except Exception:
+        try:
+            root.tk.call("tk", "scaling", 1.25)
+        except tk.TclError:
+            pass
+    app = App(root)
+    app.thinking.tag_configure("sys", foreground="#56b6c2",
+                               font=(BOARD_TEXT_FONT, THINK_FONT_SIZE, "bold"))
+    app.thinking.tag_configure("think", foreground="#d4d4d4",
+                               font=(BOARD_TEXT_FONT, THINK_FONT_SIZE))
+    app.thinking.tag_configure("act", foreground="#98c379",
+                               font=(BOARD_TEXT_FONT, THINK_FONT_SIZE, "bold"))
+    app.thinking.tag_configure("res", foreground="#61afef",
+                               font=(BOARD_TEXT_FONT, THINK_FONT_SIZE))
+    app.thinking.tag_configure("err", foreground="#e06c75",
+                               font=(BOARD_TEXT_FONT, THINK_FONT_SIZE, "bold"))
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

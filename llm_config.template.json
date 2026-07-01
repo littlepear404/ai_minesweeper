@@ -1,0 +1,38 @@
+{
+  "provider": "openai",
+  "api_base_url": "https://api.openai.com/v1",
+  "api_key": "YOUR_API_KEY_HERE",
+  "model": "gpt-4.1-mini",
+  "temperature": 0.4,
+  "max_tokens": 1024,
+  "request_timeout": 120,
+  "move_delay": 0.6,
+  "keep_recent_turns": 30,
+  "max_no_action_retries": 10,
+  "cell_size": 32,
+
+  "_anthropic_example": {
+    "provider": "anthropic",
+    "api_base_url": "https://api.anthropic.com/v1",
+    "api_key": "YOUR_API_KEY_HERE",
+    "model": "claude-3-5-sonnet-latest",
+    "temperature": 0.4,
+    "max_tokens": 1024,
+    "request_timeout": 120,
+    "move_delay": 0.6,
+    "keep_recent_turns": 30,
+    "max_no_action_retries": 10,
+    "cell_size": 32
+  },
+
+  "_openai_compatible_examples": {
+    "openai": {
+      "api_base_url": "https://api.openai.com/v1",
+      "model": "gpt-4.1-mini"
+    },
+    "deepseek": {
+      "api_base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    }
+  }
+}
