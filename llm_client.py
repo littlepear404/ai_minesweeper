@@ -1,5 +1,7 @@
-"""LLM client supporting OpenAI-compatible and Anthropic message formats with
-tool calling. Conversation history is kept in each provider's native format.
+"""LLM client supporting OpenAI-compatible and Anthropic message formats.
+
+The current game loop uses stateless JSON responses to reduce tokens. The older
+tool-call helpers are kept for compatibility with previous experiments.
 """
 import json
 from urllib.parse import urlparse
@@ -100,8 +102,16 @@ class LLMClient:
         self.timeout = config.get("request_timeout", 120)
         self.tool_choice = config.get("tool_choice", "required")
         self.omit_tool_choice = self._should_omit_tool_choice(config)
+        self.response_format = config.get("response_format", "json_object")
         self.system_prompt = ""
         self.history = []  # native-format message list
+        self.last_usage = {}
+        self.total_usage = {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_tokens": 0,
+        }
         if self.provider not in ("openai", "anthropic"):
             raise LLMError(f"不支持的 provider: {self.provider}")
         if not self.api_base_url:
@@ -115,6 +125,105 @@ class LLMClient:
             self.history = []
         else:
             self.history = [{"role": "system", "content": system_prompt}]
+        self.last_usage = {}
+        self.total_usage = {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_tokens": 0,
+        }
+
+    def request_json(self, user_text):
+        """Make one stateless request and return raw JSON text plus usage.
+
+        No assistant content, tool calls, tool results, or previous board
+        snapshots are retained or sent.
+        """
+        if self.provider == "openai":
+            result = self._request_json_openai(user_text)
+        else:
+            result = self._request_json_anthropic(user_text)
+        self.last_usage = result.get("usage", {})
+        self._accumulate_usage(self.last_usage)
+        return result
+
+    def _request_json_openai(self, user_text):
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if self.response_format:
+            body["response_format"] = {"type": self.response_format}
+        url = f"{self.api_base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            data = self._post(url, headers=headers, body=body)
+        except LLMError as e:
+            if not self.response_format or "response_format" not in str(e):
+                raise
+            body.pop("response_format", None)
+            data = self._post(url, headers=headers, body=body)
+        msg = data["choices"][0]["message"]
+        raw_text = (msg.get("content") or "").strip()
+        if not raw_text and msg.get("reasoning_content"):
+            raw_text = msg.get("reasoning_content", "").strip()
+        return {"raw_text": raw_text, "usage": self._normalize_usage(data.get("usage", {}))}
+
+    def _request_json_anthropic(self, user_text):
+        body = {
+            "model": self.model,
+            "system": self.system_prompt,
+            "messages": [{"role": "user", "content": user_text}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        data = self._post(
+            f"{self.api_base_url}/messages",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            body=body,
+        )
+        parts = []
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return {"raw_text": "".join(parts).strip(), "usage": self._normalize_usage(data.get("usage", {}))}
+
+    def _normalize_usage(self, usage):
+        prompt = (
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or usage.get("prompt_cache_miss_tokens")
+            or 0
+        )
+        completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        cache = (
+            usage.get("prompt_cache_hit_tokens")
+            or usage.get("cache_read_input_tokens")
+            or usage.get("cached_tokens")
+            or 0
+        )
+        return {
+            "input_tokens": int(prompt or 0),
+            "output_tokens": int(completion or 0),
+            "cache_tokens": int(cache or 0),
+            "raw": usage or {},
+        }
+
+    def _accumulate_usage(self, usage):
+        self.total_usage["requests"] += 1
+        self.total_usage["input_tokens"] += usage.get("input_tokens", 0)
+        self.total_usage["output_tokens"] += usage.get("output_tokens", 0)
+        self.total_usage["cache_tokens"] += usage.get("cache_tokens", 0)
 
     # ---- main entry: do one model call with current history ----
     def turn(self, user_text):

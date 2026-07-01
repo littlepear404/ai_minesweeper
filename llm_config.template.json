@@ -7,8 +7,13 @@
   "max_tokens": 1024,
   "request_timeout": 120,
   "move_delay": 0.6,
-  "keep_recent_turns": 30,
   "max_no_action_retries": 10,
+  "STATELESS_MODE": true,
+  "ENABLE_BATCH_ACTIONS": true,
+  "MAX_BATCH_ACTIONS": 8,
+  "ENABLE_REASON": false,
+  "PROBABILISTIC_ACTION_BATCH_LIMIT": 1,
+  "PREFER_CHORD": true,
   "cell_size": 32,
 
   "_anthropic_example": {
@@ -20,8 +25,13 @@
     "max_tokens": 1024,
     "request_timeout": 120,
     "move_delay": 0.6,
-    "keep_recent_turns": 30,
     "max_no_action_retries": 10,
+    "STATELESS_MODE": true,
+    "ENABLE_BATCH_ACTIONS": true,
+    "MAX_BATCH_ACTIONS": 8,
+    "ENABLE_REASON": false,
+    "PROBABILISTIC_ACTION_BATCH_LIMIT": 1,
+    "PREFER_CHORD": true,
     "cell_size": 32
   },
 
