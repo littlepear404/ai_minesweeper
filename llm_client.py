@@ -1,7 +1,7 @@
-"""LLM client supporting OpenAI-compatible and Anthropic message formats.
+"""LLM client supporting OpenAI-compatible and Anthropic tool calling.
 
-The current game loop uses stateless JSON responses to reduce tokens. The older
-tool-call helpers are kept for compatibility with previous experiments.
+The game loop uses stateless tool-call requests to reduce tokens: every turn
+sends only the fixed system prompt, current board state, and tool definitions.
 """
 import json
 from urllib.parse import urlparse
@@ -98,11 +98,11 @@ class LLMClient:
         self.api_key = config.get("api_key", "")
         self.model = config.get("model", "")
         self.temperature = config.get("temperature", 0.4)
+        self.tool_temperature = config.get("tool_temperature", 0)
         self.max_tokens = config.get("max_tokens", 1024)
         self.timeout = config.get("request_timeout", 120)
         self.tool_choice = config.get("tool_choice", "required")
         self.omit_tool_choice = self._should_omit_tool_choice(config)
-        self.response_format = config.get("response_format", "json_object")
         self.system_prompt = ""
         self.history = []  # native-format message list
         self.last_usage = {}
@@ -133,21 +133,21 @@ class LLMClient:
             "cache_tokens": 0,
         }
 
-    def request_json(self, user_text):
-        """Make one stateless request and return raw JSON text plus usage.
+    def request_tools(self, user_text):
+        """Make one stateless request and return any tool calls plus usage.
 
         No assistant content, tool calls, tool results, or previous board
         snapshots are retained or sent.
         """
         if self.provider == "openai":
-            result = self._request_json_openai(user_text)
+            result = self._request_tools_openai(user_text)
         else:
-            result = self._request_json_anthropic(user_text)
+            result = self._request_tools_anthropic(user_text)
         self.last_usage = result.get("usage", {})
         self._accumulate_usage(self.last_usage)
         return result
 
-    def _request_json_openai(self, user_text):
+    def _request_tools_openai(self, user_text):
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_text},
@@ -155,32 +155,44 @@ class LLMClient:
         body = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature,
+            "tools": build_openai_tools(),
+            "temperature": self.tool_temperature,
             "max_tokens": self.max_tokens,
         }
-        if self.response_format:
-            body["response_format"] = {"type": self.response_format}
+        if self.tool_choice is not None and not self.omit_tool_choice:
+            body["tool_choice"] = self.tool_choice
         url = f"{self.api_base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        try:
-            data = self._post(url, headers=headers, body=body)
-        except LLMError as e:
-            if not self.response_format or "response_format" not in str(e):
-                raise
-            body.pop("response_format", None)
-            data = self._post(url, headers=headers, body=body)
+        data = self._post(url, headers=headers, body=body)
         msg = data["choices"][0]["message"]
-        raw_text = (msg.get("content") or "").strip()
-        if not raw_text and msg.get("reasoning_content"):
-            raw_text = msg.get("reasoning_content", "").strip()
-        return {"raw_text": raw_text, "usage": self._normalize_usage(data.get("usage", {}))}
+        thinking_parts = []
+        if msg.get("reasoning_content"):
+            thinking_parts.append(msg["reasoning_content"])
+        if msg.get("content"):
+            thinking_parts.append(msg["content"])
+        tool_calls = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {}) or {}
+            try:
+                args = json.loads(fn.get("arguments", "{}") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append({"id": tc.get("id"), "name": fn.get("name"), "args": args})
+        return {
+            "thinking": "\n".join(thinking_parts).strip(),
+            "tool_calls": tool_calls,
+            "finish_reason": (data.get("choices") or [{}])[0].get("finish_reason"),
+            "usage": self._normalize_usage(data.get("usage", {})),
+        }
 
-    def _request_json_anthropic(self, user_text):
+    def _request_tools_anthropic(self, user_text):
         body = {
             "model": self.model,
             "system": self.system_prompt,
             "messages": [{"role": "user", "content": user_text}],
-            "temperature": self.temperature,
+            "tools": build_anthropic_tools(),
+            "tool_choice": {"type": "any" if self.tool_choice == "required" else "auto"},
+            "temperature": self.tool_temperature,
             "max_tokens": self.max_tokens,
         }
         data = self._post(
@@ -192,11 +204,24 @@ class LLMClient:
             },
             body=body,
         )
-        parts = []
+        thinking_parts = []
+        tool_calls = []
         for block in data.get("content", []):
             if block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return {"raw_text": "".join(parts).strip(), "usage": self._normalize_usage(data.get("usage", {}))}
+                thinking_parts.append(block.get("text", ""))
+            elif block.get("type") == "thinking":
+                thinking_parts.append(block.get("thinking", ""))
+            elif block.get("type") == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "args": block.get("input", {}) or {},
+                })
+        return {
+            "thinking": "\n".join(p for p in thinking_parts if p).strip(),
+            "tool_calls": tool_calls,
+            "usage": self._normalize_usage(data.get("usage", {})),
+        }
 
     def _normalize_usage(self, usage):
         prompt = (
