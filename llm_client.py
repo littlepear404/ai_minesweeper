@@ -100,6 +100,7 @@ class LLMClient:
         self.timeout = config.get("request_timeout", 120)
         self.tool_choice = config.get("tool_choice", "required")
         self.omit_tool_choice = self._should_omit_tool_choice(config)
+        self.tool_temperature = config.get("tool_temperature")
         self.system_prompt = ""
         self.history = []  # native-format message list
         if self.provider not in ("openai", "anthropic"):
@@ -145,6 +146,18 @@ class LLMClient:
         else:
             yield from self._turn_anthropic_stream(user_text)
 
+    def call_stateless_stream(self, system_text, board_text):
+        """Streaming call with NO history involvement.
+
+        Returns fresh messages=[system+user] each call; does not read or
+        mutate self.history. Yields the same ("chunk"/"final") 2-tuples
+        as turn_stream.
+        """
+        if self.provider == "openai":
+            yield from self._stateless_openai_stream(system_text, board_text)
+        else:
+            yield from self._stateless_anthropic_stream(system_text, board_text)
+
     # ---------- OpenAI format ----------
     def _build_openai_body(self, messages, stream=False):
         body = {
@@ -158,6 +171,8 @@ class LLMClient:
             body["tool_choice"] = self.tool_choice
         if stream:
             body["stream"] = True
+        if self.tool_temperature is not None:
+            body["tool_temperature"] = self.tool_temperature
         return body
 
     def _turn_openai(self, user_text):
@@ -287,6 +302,120 @@ class LLMClient:
         is_deepseek_official = host == "api.deepseek.com" or host.endswith(".api.deepseek.com")
         is_deepseek_reasoning = "deepseek-reasoner" in model or "deepseek-v4" in model
         return is_deepseek_official and is_deepseek_reasoning
+
+    # ---------- stateless streaming ----------
+    def _stateless_openai_stream(self, system_text, board_text):
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": board_text},
+        ]
+        body = self._build_openai_body(messages, stream=True)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        resp = self._post_stream(f"{self.api_base_url}/chat/completions",
+                                 headers=headers, body=body)
+        content_parts = []
+        reasoning_parts = []
+        tool_calls_acc = {}
+        for evt in resp:
+            if evt.get("object") == "chat.completion.chunk":
+                choices = evt.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                if delta.get("reasoning_content"):
+                    reasoning_parts.append(delta["reasoning_content"])
+                    yield ("chunk", delta["reasoning_content"])
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                    yield ("chunk", delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function", {}) or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+        content = "".join(content_parts)
+        reasoning = "".join(reasoning_parts)
+        thinking_parts = []
+        if reasoning:
+            thinking_parts.append(reasoning)
+        if content:
+            thinking_parts.append(content)
+        thinking = "\n".join(thinking_parts).strip()
+        built_tcs = []
+        for idx in sorted(tool_calls_acc.keys()):
+            slot = tool_calls_acc[idx]
+            try:
+                args = json.loads(slot["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            built_tcs.append({"id": slot["id"], "name": slot["name"], "args": args})
+        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
+
+    def _stateless_anthropic_stream(self, system_text, board_text):
+        body = {
+            "model": self.model,
+            "system": system_text,
+            "messages": [{"role": "user", "content": board_text}],
+            "tools": build_anthropic_tools(),
+            "tool_choice": {"type": "any" if self.tool_choice == "required" else "auto"},
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": True,
+        }
+        resp = self._post_stream(
+            f"{self.api_base_url}/messages",
+            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
+            body=body,
+        )
+        content_blocks = []
+        thinking_parts = []
+        for evt in resp:
+            etype = evt.get("type", "")
+            if etype == "content_block_start":
+                block = evt.get("content_block", {}) or {}
+                idx = evt.get("index", len(content_blocks))
+                while len(content_blocks) <= idx:
+                    content_blocks.append(dict(block))
+            elif etype == "content_block_delta":
+                idx = evt.get("index", 0)
+                delta = evt.get("delta", {}) or {}
+                block = content_blocks[idx] if idx < len(content_blocks) else {}
+                dt = delta.get("type", "")
+                if dt == "text_delta":
+                    txt = delta.get("text", "")
+                    block["text"] = block.get("text", "") + txt
+                    thinking_parts.append(txt)
+                    yield ("chunk", txt)
+                elif dt == "thinking_delta":
+                    txt = delta.get("thinking", "")
+                    block["thinking"] = block.get("thinking", "") + txt
+                    thinking_parts.append(txt)
+                    yield ("chunk", txt)
+                elif dt == "input_json_delta":
+                    block["input"] = (block.get("input", "") or "") + delta.get("partial_json", "")
+                elif dt == "tool_use":
+                    pass
+            elif etype == "message_stop":
+                break
+        built_tcs = []
+        for block in content_blocks:
+            if block.get("type") == "tool_use":
+                raw = block.get("input", "")
+                try:
+                    args = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    args = {}
+                block["input"] = args
+                built_tcs.append({
+                    "id": block.get("id"), "name": block.get("name"), "args": args,
+                })
+        thinking = "\n".join(p for p in thinking_parts if p).strip()
+        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
 
     # ---------- Anthropic format ----------
     def _turn_anthropic(self, user_text):
