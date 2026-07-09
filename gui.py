@@ -104,7 +104,7 @@ class App:
         self.cell_size = self.cfg.get("cell_size", 32)
         self.move_delay = self.cfg.get("move_delay", 0.6)
         self.keep_recent = self.cfg.get("keep_recent_turns", 30)
-        self.max_no_action = self.cfg.get("max_no_action_retries", 3)
+        self.max_no_action = self.cfg.get("max_no_action_retries", 10)
 
         self._apply_fonts()
 
@@ -151,11 +151,22 @@ class App:
         body = ttk.Frame(self.root)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-        # Left: board
+        # Left: board (scrollable so expert 30x16 boards stay reachable)
         left = ttk.Frame(body)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)
-        self.canvas = tk.Canvas(left, bg="#bdbdbd", highlightthickness=0)
-        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        board_frame = ttk.Frame(left)
+        board_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(board_frame, bg="#bdbdbd", highlightthickness=0)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb = ttk.Scrollbar(board_frame, orient=tk.VERTICAL,
+                             command=self.canvas.yview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb = ttk.Scrollbar(board_frame, orient=tk.HORIZONTAL,
+                             command=self.canvas.xview)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.config(xscrollcommand=hsb.set, yscrollcommand=vsb.set)
+        self.canvas.bind("<MouseWheel>", self._on_board_mousewheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_board_mousewheel_shift)
         status = ttk.Frame(left)
         status.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT)
@@ -244,8 +255,15 @@ class App:
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
             return
+        # Apply every tunable that can change at runtime; cell_size also
+        # needs a redraw so the new board sizing takes effect.
+        prev_cell_size = self.cell_size
         self.move_delay = self.cfg.get("move_delay", self.move_delay)
         self.keep_recent = self.cfg.get("keep_recent_turns", self.keep_recent)
+        self.max_no_action = self.cfg.get("max_no_action_retries", self.max_no_action)
+        self.cell_size = self.cfg.get("cell_size", self.cell_size)
+        if self.cell_size != prev_cell_size and self.game is not None:
+            self._draw_board()
         messagebox.showinfo("已加载", f"配置已加载:\n{path}")
 
     # -------------------------- drawing -------------------------- #
@@ -291,6 +309,19 @@ class App:
             f"{self.difficulty_var.get()} | {g.width}x{g.height} 雷 {g.num_mines} | "
             f"翻开 {g.revealed_count} | 状态: {state_text}"
         )
+
+    def _on_board_mousewheel(self, event):
+        # Vertical scroll on most mice; horizontal if Shift held on Windows.
+        if event.state & 0x1:
+            self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        else:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_board_mousewheel_shift(self, event):
+        # Shift+Wheel maps to horizontal scroll on some platforms.
+        self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
 
     # -------------------------- thinking panel -------------------------- #
     def _clear_thinking(self):
@@ -351,6 +382,7 @@ class App:
     # -------------------------- LLM worker thread -------------------------- #
     def _run_loop_stateless(self):
         no_action = 0
+        no_progress = 0  # rounds where the model returned calls but none executed
         last_summary = ""
         while self.running:
             g = self.game
@@ -457,6 +489,17 @@ class App:
                 time.sleep(self.move_delay)
 
             # round summary for next LLM call
+            # A model that keeps returning tool calls which are all skipped
+            # (invalid/unknown/over) never increments no_action, so count
+            # those no-progress rounds separately to avoid an endless loop.
+            if tool_calls and not action_log:
+                no_progress += 1
+            else:
+                no_progress = 0
+            if no_progress >= self.max_no_action:
+                self._put("error", "连续多次返回无效/无执行动作，自动停止。")
+                self._put("end", None)
+                return
             parts = []
             if action_log:
                 parts.append("上轮已执行: " + ", ".join(action_log))

@@ -221,27 +221,28 @@ class LLMClient:
         reasoning_parts = []
         tool_calls_acc = {}  # index -> dict
         for evt in resp:
-            if evt.get("object") == "chat.completion.chunk":
-                choices = evt.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {}) or {}
-                if delta.get("reasoning_content"):
-                    reasoning_parts.append(delta["reasoning_content"])
-                    yield ("chunk", delta["reasoning_content"])
-                if delta.get("content"):
-                    content_parts.append(delta["content"])
-                    yield ("chunk", delta["content"])
-                for tc in delta.get("tool_calls") or []:
-                    idx = tc.get("index", 0)
-                    slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    fn = tc.get("function", {}) or {}
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["arguments"] += fn["arguments"]
+            if not self._is_openai_chunk(evt):
+                continue
+            choices = evt.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {}) or {}
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+                yield ("chunk", delta["reasoning_content"])
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+                yield ("chunk", delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function", {}) or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
         content = "".join(content_parts)
         reasoning = "".join(reasoning_parts)
         thinking_parts = []
@@ -303,6 +304,27 @@ class LLMClient:
         is_deepseek_reasoning = "deepseek-reasoner" in model or "deepseek-v4" in model
         return is_deepseek_official and is_deepseek_reasoning
 
+    @staticmethod
+    def _is_openai_chunk(evt):
+        """Detect an OpenAI-style streaming chunk by structure, not by the
+        literal `object` field.
+
+        Some OpenAI-compatible servers omit or rename `object`
+        (e.g. do not send "chat.completion.chunk"). Gating purely on that
+        string silently drops every chunk, so we instead accept any event
+        that carries the expected `choices`/`delta` payload (and never an
+        explicit unrelated type such as SSE comments or DONE markers).
+        """
+        if not isinstance(evt, dict):
+            return False
+        if evt.get("object") == "chat.completion.chunk":
+            return True
+        choices = evt.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return False
+        delta = choices[0].get("delta")
+        return isinstance(delta, dict)
+
     # ---------- stateless streaming ----------
     def _stateless_openai_stream(self, system_text, board_text):
         messages = [
@@ -317,27 +339,28 @@ class LLMClient:
         reasoning_parts = []
         tool_calls_acc = {}
         for evt in resp:
-            if evt.get("object") == "chat.completion.chunk":
-                choices = evt.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {}) or {}
-                if delta.get("reasoning_content"):
-                    reasoning_parts.append(delta["reasoning_content"])
-                    yield ("chunk", delta["reasoning_content"])
-                if delta.get("content"):
-                    content_parts.append(delta["content"])
-                    yield ("chunk", delta["content"])
-                for tc in delta.get("tool_calls") or []:
-                    idx = tc.get("index", 0)
-                    slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    fn = tc.get("function", {}) or {}
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["arguments"] += fn["arguments"]
+            if not self._is_openai_chunk(evt):
+                continue
+            choices = evt.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {}) or {}
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+                yield ("chunk", delta["reasoning_content"])
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+                yield ("chunk", delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function", {}) or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
         content = "".join(content_parts)
         reasoning = "".join(reasoning_parts)
         thinking_parts = []
@@ -545,7 +568,14 @@ class LLMClient:
             })
 
     def trim_history(self, keep_turns):
-        """Keep the first system/opening message(s) and the last keep_turns turn-pairs."""
+        """Keep the first system/opening message(s) and the last keep_turns turn-pairs.
+
+        For the OpenAI provider, the retained window is also advanced to a
+        safe message boundary: it never starts with a `tool` result (no
+        matching assistant call) nor with an `assistant` message that still
+        carries `tool_calls` whose corresponding `tool` result was trimmed
+        off -- either case makes the next API request invalid.
+        """
         if keep_turns is None or keep_turns <= 0:
             return
         if self.provider == "openai":
@@ -557,8 +587,16 @@ class LLMClient:
         # keep the last keep_turns*2 messages (each turn = user+assistant(+tool result))
         window = rest[-max(keep_turns * 2, 6):]
         if self.provider == "openai":
+            # Drop leading tool results with no preceding assistant call.
             while window and window[0].get("role") == "tool":
                 window = window[1:]
+            # Drop a leading assistant message whose tool_calls were cut off
+            # (i.e. no following tool result remains in the window).
+            while window and window[0].get("role") == "assistant" and window[0].get("tool_calls"):
+                if not any(m.get("role") == "tool" for m in window[1:]):
+                    window = window[1:]
+                else:
+                    break
         self.history = system + window
 
     # ---------- low level ----------
