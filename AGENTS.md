@@ -18,18 +18,28 @@ minesweeper.py llm_client.py gui.py main.py` and the smoke check below.
 - `minesweeper.py` — pure game logic. No I/O, no Tkinter. First click is
   always safe (3x3 safe zone generated on first reveal via `_place_mines`).
   Board state machine: `ready -> playing -> won|lost`. Use `Minesweeper.from_preset(name)`; presets live in `DIFFICULTIES` (beginner/intermediate/expert).
+- `game_driver.py` — **tkinter-free** headless game loop. Holds
+  `SYSTEM_PROMPT`, `load_config()`, `_format_tool_result()`, and the core
+  `run_stateless_loop(game, client, emit, *, move_delay, max_no_action,
+  stop_check, system_prompt)`. `emit(kind, payload)` is the single
+  integration point; GUI and CLI are just different `emit` adapters. The loop
+  terminates on: empty tool-call rounds (`no_action`), all-skipped/no-progress
+  rounds (`no_progress` — covers the repeated-`nochange` infinite-loop trap),
+  game over, or `stop_check()` returning True. Keep `SYSTEM_PROMPT` in sync
+  with `Minesweeper.to_text_compact()`'s snapshot format.
+- `cli.py` — headless entry point (`python -m cli`) for debugging the LLM
+  loop without the GUI. Adapts `emit` to stdout and Ctrl-C to `stop_check`.
 - `gui.py` — Tkinter UI + the LLM driver thread. **Two worker paths**:
-  - `_run_loop_stateless` (default, for "开始/重启"): each LLM call sends
-    *only* `SYSTEM_PROMPT` + current board snapshot — no history. The model
-    may return a batch of 1-5 tool_calls; the program executes them
-    sequentially, re-validating each against the latest board state. Actions
-    are interrupted on: `nochange`, single-cell reveal (≤1 opened, heuristic
-    for guessing), game over, or `invalid`/`over`. Auto-flag runs after each
-    reveal/chord. A 1-2 line `last_round_summary` is appended to the next
-    snapshot so the LLM knows which actions were executed/skipped.
+  - `_run_loop_stateless` (default, for "开始/重启"): a thin delegate that
+    calls `run_stateless_loop(...)` from `game_driver.py`, passing
+    `self._put` as `emit` and `lambda: not self.running` as `stop_check`.
+    The actual loop logic lives in `game_driver.py` so it can be tested and
+    run from the CLI without Tkinter.
   - `_run_loop_stateful` (for "继续"): legacy path that uses `client.turn_stream`,
     `add_tool_result`, and `trim_history`. Preserves conversation context
-    across the paused game.
+    across the paused game. NOTE: this legacy path still lacks the
+    `no_progress` guard and can loop on repeated `nochange`; prefer the
+    stateless driver for new work.
   Both post `(kind, payload)` tuples to `self.cmd_queue`; the main thread
   polls it every 100ms via `_poll_queue`/`_handle_cmd`.
 - `llm_client.py` — thin HTTP client. Three call styles:
@@ -62,7 +72,7 @@ minesweeper.py llm_client.py gui.py main.py` and the smoke check below.
   label-free per-row string, ~69% fewer tokens than `to_text()` on expert)
   as the LLM's whole view of the game; unrevealed = `.`, flags = `F`,
   revealed numbers 0-8. `summary()` carries the row/col totals for
-  coordinate lookup. `SYSTEM_PROMPT` in `gui.py` is kept deliberately
+  coordinate lookup. `SYSTEM_PROMPT` lives in `game_driver.py` (kept deliberately
   terse (~half the original token cost) — if you change the snapshot
   format, keep `SYSTEM_PROMPT`'s board description in sync.
 - Auto-flag: `Minesweeper.auto_flag_certain_mines()` runs after every
@@ -103,11 +113,15 @@ use).
   finished game: difficulty, size, model, provider, moves, revealed
   count, duration, seed). The "查看战绩" button shows a rolling
   win-rate/average summary via `run_history.summarize()`.
-- Tests live in `tests/` (`test_minesweeper.py`, `test_llm_client.py`); run with
-  `python -m unittest tests.test_minesweeper tests.test_llm_client`.
-  Covers game logic plus `llm_client` tool-result formatting, SSE chunk
-  detection, streaming parse, and history trimming (mocked `requests`).
-  `tests/test_run_history.py` covers the JSONL persistence and summary.
+- Tests live in `tests/`; run the full suite with
+  `python -m unittest tests.test_minesweeper tests.test_llm_client tests.test_run_history tests.test_game_driver`.
+  Covers game logic, `llm_client` tool-result formatting, SSE chunk
+  detection, streaming parse, history trimming (mocked `requests`),
+  run-history JSONL persistence/summary, and `game_driver` loop-termination
+  guards (including the repeated-`nochange` infinite-loop regression).
+- The game loop is decoupled from the GUI: `python -m cli` runs the same
+  `run_stateless_loop` headlessly (no Tkinter) so the LLM's behaviour, token
+  usage, and tool-call parsing can be debugged from a terminal.
 - LLM debugging requires a real API key in `llm_config.json` — deferred until
   the user provides one. With the placeholder key, `LLMClient.__init__` raises
   `LLMError`, so "开始/重启" shows a config-error dialog (expected).

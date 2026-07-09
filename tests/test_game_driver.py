@@ -1,0 +1,110 @@
+"""Tests for the headless game driver (game_driver.py).
+
+These run with NO tkinter and NO network: they exercise run_stateless_loop
+with a fake LLM client so the loop's termination guards (empty-tool-call
+rounds, all-skipped rounds, and the no-progress / repeated-nochange case)
+are locked in. They also assert the decoupling contract: game_driver must
+not import tkinter.
+"""
+import sys
+import unittest
+
+from minesweeper import Minesweeper
+
+
+class _FakeClient:
+    """Echoes a fixed list of tool-call responses, one per model call.
+
+    Each entry is a list of tool_calls dicts to return on that call.
+    After the list is exhausted, returns no tool calls (forces no_action).
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def call_stateless_stream(self, system_text, board_text):
+        idx = min(self.calls, len(self._responses) - 1)
+        tcs = self._responses[idx] if self._responses else []
+        self.calls += 1
+        yield ("chunk", "thinking")
+        yield ("final", {"tool_calls": tcs})
+
+
+def _collect(game, client, **kw):
+    events = []
+    from game_driver import run_stateless_loop
+    run_stateless_loop(game, client, lambda k, p: events.append((k, p)), **kw)
+    return events
+
+
+class GameDriverNoTkinterTest(unittest.TestCase):
+    def test_no_tkinter_import(self):
+        if "tkinter" in sys.modules:
+            self.skipTest("tkinter already imported in this process")
+        import importlib
+        import game_driver
+        importlib.reload(game_driver)
+        self.assertNotIn("tkinter", sys.modules)
+
+
+class LoopTerminationTest(unittest.TestCase):
+    def test_empty_tool_calls_stops(self):
+        # A model that never returns tool calls must stop after max_no_action.
+        g = Minesweeper.from_preset("beginner")
+        g.reveal(0, 0)
+        events = _collect(g, _FakeClient([]), move_delay=0,
+                          max_no_action=3, stop_check=lambda: False)
+        kinds = [k for k, _ in events]
+        self.assertIn("end", kinds)
+        self.assertIn("error", kinds)
+
+    def test_all_skipped_stops(self):
+        # Unknown-tool calls never change the board -> no_progress guard.
+        g = Minesweeper.from_preset("beginner")
+        g.reveal(0, 0)
+        bad = [{"name": "frobnicate", "args": {"row": 0, "col": 0}}]
+        events = _collect(g, _FakeClient([bad] * 10), move_delay=0,
+                          max_no_action=3, stop_check=lambda: False)
+        kinds = [k for k, _ in events]
+        self.assertIn("end", kinds)
+        self.assertIn("error", kinds)
+
+    def test_repeated_nochange_stops(self):
+        # The regression: re-calling an already-revealed cell yields
+        # "nochange" every round. action_log is non-empty, so the old
+        # guard (not action_log) never tripped and the loop spun forever.
+        g = Minesweeper.from_preset("beginner")
+        g.reveal(0, 0)  # (0,0) now revealed
+        repeat = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
+        events = _collect(g, _FakeClient([repeat] * 50), move_delay=0,
+                          max_no_action=3, stop_check=lambda: False)
+        kinds = [k for k, _ in events]
+        self.assertIn("end", kinds)
+        self.assertIn("error", kinds)
+
+    def test_stop_check_aborts(self):
+        g = Minesweeper.from_preset("beginner")
+        g.reveal(0, 0)
+        repeat = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
+        events = _collect(g, _FakeClient([repeat] * 50), move_delay=0,
+                          max_no_action=10, stop_check=lambda: True)
+        # stop_check True at the very top -> immediate return, no "end" emit.
+        self.assertNotIn("end", [k for k, _ in events])
+
+    def test_real_progress_keeps_going(self):
+        # A first-move reveal that opens cells is real progress; the loop
+        # should not trip the no_progress guard on a single such round.
+        g = Minesweeper.from_preset("beginner")
+        first = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
+        events = _collect(g, _FakeClient([first] * 50), move_delay=0,
+                          max_no_action=3, stop_check=lambda: False)
+        # After the first real reveal, subsequent reveals of (0,0) are
+        # nochange -> eventually stops, but only after >= max_no_action
+        # no-progress rounds, and it must have emitted at least one action.
+        self.assertIn("action", [k for k, _ in events])
+        self.assertIn("end", [k for k, _ in events])
+
+
+if __name__ == "__main__":
+    unittest.main()

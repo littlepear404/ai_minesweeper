@@ -27,41 +27,13 @@ except Exception:
 from minesweeper import Minesweeper, DIFFICULTIES, NUMBER_COLORS
 from llm_client import LLMClient, LLMError
 from run_history import record as record_run, summarize as summarize_runs
+from game_driver import (
+    SYSTEM_PROMPT, load_config, _format_tool_result, run_stateless_loop,
+)
 
 UI_FONT_SIZE = 14
 THINK_FONT_SIZE = 14
 BOARD_TEXT_FONT = "Consolas"
-
-
-CONFIG_PATH = "llm_config.json"
-
-SYSTEM_PROMPT = """经典扫雷: 翻开所有非雷格即获胜, 踩雷即输。
-坐标 row/col 均从0开始(左上角0,0)。
-
-棋盘为紧凑文本(每行一串, 行从上到下、列从左到右, 索引0):
-  '.' 未翻开   'F' 你插的旗(疑雷)   0-8 已翻开格的周围雷数   '*' 雷(仅输/赢时出现)
-棋盘末行"已翻开 X/Y 安全格"给出总行/列数, 供你定位 (row,col)。
-
-你是"当前局面动作建议器"(非多步规划器), 不要预判某步之后的新信息。
-每轮: 1) 用 ≤2-3 句简体中文极简说明推理要点(哪些格确定安全/是雷/可双击), 勿逐格列棋盘; 2) 紧跟 1~5 个工具调用。
-
-工具(坐标0-index):
-- reveal(r,c): 翻开。雷=>输; 数字=>显示周围雷数; 0格=>自动展开相邻安全区。
-- toggle_flag(r,c): 切换未翻开格的旗(标记/取消疑雷)。
-- chord(r,c): 对已翻开数字格双击; 当周围旗数==该数字时, 一次性翻开周围未翻开未插旗格; 旗标错则踩雷输。
-
-程序会顺序执行你的工具列表, 每步后用最新棋盘重校验; 触发胜利/踩雷/大面积展开或判定为猜测即自动停后续。自动插旗: 数字N周围(未翻开+已插旗)==N 时必为雷, 直接标'F'。首点保护: 第一步永不踩雷(周围3x3无雷), 可选中心附近。
-
-策略: 1) 优先 reveal/chord 确定性安全格, 旗数==数字且有未翻格时必用 chord(最省步骤)。 2) 数字N周围恰N个未翻格即雷->插旗。 3) 无确定格时选雷数约束最松处, 避大数字硬猜。 4) 猜测/单格试探本轮只出这一个动作。 5) 纯逻辑无法推进才概率猜并简述。
-上轮若有动作被跳过, 棋盘下方"上轮结果"会告知, 据此调整。"""
-
-
-
-def load_config(path=CONFIG_PATH):
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg
-
 
 class App:
     def __init__(self, root):
@@ -416,137 +388,15 @@ class App:
 
     # -------------------------- LLM worker thread -------------------------- #
     def _run_loop_stateless(self):
-        no_action = 0
-        no_progress = 0  # rounds where the model returned calls but none executed
-        last_summary = ""
-        while self.running:
-            g = self.game
-            if g.state in ("won", "lost"):
-                self._put("end", None)
-                return
-            hint = ""
-            if not g.first_move_done:
-                hint = "\n(第一步: 首点周围永远安全, 推荐中心附近)"
-            snapshot = (
-                "棋盘(每行一串, 行从上到下, 列从左到右, 索引0开始; "
-                "'.' 未翻开, 'F' 旗, '0'-'8' 已翻开雷数):\n"
-                + g.to_text_compact() + "\n" + g.summary()
-                + hint + last_summary
-            )
-            if no_action > 0:
-                snapshot += f"\n(上一轮未返回工具调用，连续空轮 {no_action} 次)"
-            self._put("think_start", None)
-            thinking = ""
-            tool_calls = []
-            try:
-                for kind, val in self.client.call_stateless_stream(
-                        SYSTEM_PROMPT, snapshot):
-                    if not self.running:
-                        self._put("think_end", None)
-                        return
-                    if kind == "chunk":
-                        self._put("think_chunk", val)
-                        thinking += val
-                    elif kind == "final":
-                        tool_calls = val.get("tool_calls") or []
-            except LLMError as e:
-                self._put("think_end", True)
-                self._put("error", f"[LLM 调用失败] {e}")
-                self._put("end", None)
-                return
-            self._put("think_end", True)
-            self._put("think_chunk", "\n")
-
-            if not tool_calls:
-                no_action += 1
-                self._put("result",
-                          f"[模型未返回工具调用] 连续空轮 {no_action}")
-                if no_action >= self.max_no_action:
-                    self._put("error", "连续多次空轮，自动停止。")
-                    self._put("end", None)
-                    return
-                continue
-            no_action = 0
-
-            # ------ batch execution ------
-            action_log, skip_log = [], []
-            for i, tc in enumerate(tool_calls):
-                if not self.running:
-                    return
-                name = tc.get("name")
-                args = tc.get("args") or {}
-                row, col = args.get("row"), args.get("col")
-                if row is None or col is None:
-                    skip_log.append(f"{name}(?,?)原因:缺少参数")
-                    self._put("result", f"[跳过] {name} 缺少参数")
-                    break
-                self._put("action", f">>> {name}(row={row}, col={col})")
-                if name == "reveal":
-                    out = g.reveal(row, col)
-                elif name == "toggle_flag":
-                    out = g.toggle_flag(row, col)
-                elif name == "chord":
-                    out = g.chord(row, col)
-                else:
-                    skip_log.append(f"{name}({row},{col})原因:未知工具")
-                    self._put("result", f"[跳过] 未知工具: {name}")
-                    break
-                self._put("redraw", None)
-                self.move_count += 1
-                res = out.get("result")
-                self._put("result", self._format_tool_result(out, name, row, col))
-                autoflags = g.auto_flag_certain_mines() if name in ("reveal", "chord") else []
-                if autoflags:
-                    cells = ", ".join(f"({r},{c})" for r, c in autoflags)
-                    self._put("result", f"  [自动插旗] {len(autoflags)} 格: {cells}")
-
-                if res in ("invalid", "over"):
-                    skip_log.append(f"{name}({row},{col})原因:{out.get('message','')}")
-                    self._put("result", "[批量中断: 动作无效/游戏已结束]")
-                    break
-
-                action_log.append(f"{name}({row},{col})")
-
-                if res == "mine":
-                    break
-                if res == "won":
-                    action_log.append("胜利!")
-                    break
-                if res == "nochange":
-                    self._put("result", f"[批量中断: {name} 无变化]")
-                    break
-
-                # heuristic: single-cell reveal = no structural progress (规则 7)
-                if name == "reveal":
-                    cells_opened = len(out.get("cells", []))
-                    if cells_opened <= 1:
-                        self._put("result", "[批量中断: 单格翻开, 后续动作可能基于旧信息]")
-                        break
-
-                time.sleep(self.move_delay)
-
-            # round summary for next LLM call
-            # A model that keeps returning tool calls which are all skipped
-            # (invalid/unknown/over) never increments no_action, so count
-            # those no-progress rounds separately to avoid an endless loop.
-            if tool_calls and not action_log:
-                no_progress += 1
-            else:
-                no_progress = 0
-            if no_progress >= self.max_no_action:
-                self._put("error", "连续多次返回无效/无执行动作，自动停止。")
-                self._put("end", None)
-                return
-            parts = []
-            if action_log:
-                parts.append("上轮已执行: " + ", ".join(action_log))
-            if skip_log:
-                parts.append("上轮跳过: " + ", ".join(skip_log))
-            last_summary = ("\n\n" + "\n".join(parts)) if parts else ""
-
-            if g.state in ("won", "lost"):
-                self._put("end", None)
-                return
+        # Delegate to the GUI-free driver; the only coupling left is the
+        # emit callback (our thread-safe queue) and the stop flag.
+        run_stateless_loop(
+            self.game, self.client, self._put,
+            move_delay=self.move_delay,
+            max_no_action=self.max_no_action,
+            stop_check=lambda: not self.running,
+            system_prompt=SYSTEM_PROMPT,
+        )
 
     def _run_loop_stateful(self):
         no_action = 0
@@ -631,7 +481,7 @@ class App:
                     out = {"result": "invalid", "message": f"未知函数: {name}"}
                     autoflags = []
                 self._put("redraw", None)
-                self._put("result", self._format_tool_result(out, name, row, col))
+                self._put("result", _format_tool_result(out, name, row, col))
                 if autoflags:
                     cell_strs = ", ".join(f"({r},{c})" for r, c in autoflags)
                     self._put("result", f"  [自动插旗] {len(autoflags)} 格: {cell_strs}")
@@ -643,35 +493,6 @@ class App:
                     return
                 self.client.trim_history(self.keep_recent)
                 time.sleep(self.move_delay)
-
-    @staticmethod
-    def _format_tool_result(out, name, row, col):
-        r = out.get("result")
-        if r == "safe":
-            n = len(out.get("cells", []))
-            if name == "chord":
-                return f"  -> 双击 ({row},{col}) 成功, 展开 {n} 格"
-            return f"  -> 翻开 ({row},{col}) 成功, 展开 {n} 格"
-        if r == "mine":
-            if name == "chord":
-                cell = out.get("cell", (row, col))
-                return f"  -> 双击踩雷! {cell} 游戏失败"
-            return f"  -> 踩雷! ({row},{col}) 游戏失败"
-        if r == "won":
-            return "  -> 胜利! 已翻开全部安全格"
-        if r == "flag":
-            return f"  -> 已在 ({row},{col}) 插旗"
-        if r == "unflag":
-            return f"  -> 已取消 ({row},{col}) 的旗"
-        if r == "nochange":
-            return f"  -> 无变化: {out.get('message','')}"
-        if r == "invalid":
-            return f"  -> 无效: {out.get('message','')}"
-        if r == "over":
-            return f"  -> 游戏已结束: {out.get('message','')}"
-        return f"  -> {out}"
-
-    @staticmethod
     def _tool_result_to_llm(out, name, row, col, autoflags=None):
         autoflags = autoflags or []
         extra = ""
