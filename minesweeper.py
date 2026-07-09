@@ -269,6 +269,26 @@ class Minesweeper:
             lines.append(row + "".join(parts))
         return "\n".join(lines)
 
+    def to_text_compact(self):
+        """Token-efficient board view for the LLM (no row/col labels).
+
+        Each line is one board row; cells are single chars:
+          '.' hidden   'F' flagged   '0'-'8' revealed number   '*' mine
+        Rows are top-to-bottom, columns left-to-right (index 0). The
+        companion `summary()` carries the revealed/flag counts, so the
+        model can locate any (row, col) without the label overhead.
+        """
+        rows = []
+        for r in range(self.height):
+            cells = []
+            for c in range(self.width):
+                if self.revealed[r][c]:
+                    cells.append(str(self.numbers[r][c]))
+                else:
+                    cells.append("F" if self.flagged[r][c] else ".")
+            rows.append("".join(cells))
+        return "\n".join(rows)
+
     def summary(self):
         total = self.width * self.height
         return (

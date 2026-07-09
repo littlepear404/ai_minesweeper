@@ -58,9 +58,13 @@ minesweeper.py llm_client.py gui.py main.py` and the smoke check below.
   validates chord legality (flag count == number) before executing.
   Coordinates are **0-indexed**; the system prompt states this and the board
   text snapshot labels rows/cols. Don't add 1.
-- Board text (`Minesweeper.to_text`) is the LLM's whole view of the game; it
-  hides unrevealed cells as `.` and flags as `F`. If you change the snapshot
-  format, also update `SYSTEM_PROMPT` in `gui.py`.
+- Board text: the stateless loop sends `Minesweeper.to_text_compact()` (a
+  label-free per-row string, ~69% fewer tokens than `to_text()` on expert)
+  as the LLM's whole view of the game; unrevealed = `.`, flags = `F`,
+  revealed numbers 0-8. `summary()` carries the row/col totals for
+  coordinate lookup. `SYSTEM_PROMPT` in `gui.py` is kept deliberately
+  terse (~half the original token cost) — if you change the snapshot
+  format, keep `SYSTEM_PROMPT`'s board description in sync.
 - Auto-flag: `Minesweeper.auto_flag_certain_mines()` runs after every
   `reveal`/`chord`. It flags any hidden neighbours of a number cell N where
   `hidden+flagged == N` (iterate to fixpoint). The LLM is informed of this
