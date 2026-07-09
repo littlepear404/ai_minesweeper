@@ -211,12 +211,15 @@ class LLMClient:
         self.history.append(assistant_msg)
         return {"thinking": thinking, "tool_calls": tool_calls}
 
-    def _turn_openai_stream(self, user_text):
-        self.history.append({"role": "user", "content": user_text})
-        body = self._build_openai_body(self.history, stream=True)
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        resp = self._post_stream(f"{self.api_base_url}/chat/completions",
-                                 headers=headers, body=body)
+    # ---------- shared streaming parsers ----------
+    # Both OpenAI-style streamers below share one parser; both Anthropic-style
+    # streamers share another. Each generator yields incremental thinking
+    # text as ("chunk", fragment) and finishes with a single
+    # ("final", {"thinking": ..., "tool_calls": [...]}) tuple. When
+    # `record` is True the resulting assistant message is also appended to
+    # self.history (the stateful path); the stateless path leaves history
+    # untouched.
+    def _parse_openai_stream(self, resp, record=False):
         content_parts = []
         reasoning_parts = []
         tool_calls_acc = {}  # index -> dict
@@ -251,7 +254,6 @@ class LLMClient:
         if content:
             thinking_parts.append(content)
         thinking = "\n".join(thinking_parts).strip()
-
         built_tcs = []
         raw_tcs = []
         for idx in sorted(tool_calls_acc.keys()):
@@ -265,12 +267,58 @@ class LLMClient:
                 "id": slot["id"], "type": "function",
                 "function": {"name": slot["name"], "arguments": slot["arguments"]},
             })
-        assistant_msg = self._build_openai_assistant_message(
-            content=content,
-            reasoning=reasoning,
-            tool_calls=raw_tcs,
-        )
-        self.history.append(assistant_msg)
+        if record:
+            self.history.append(self._build_openai_assistant_message(
+                content=content, reasoning=reasoning, tool_calls=raw_tcs))
+        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
+
+    def _parse_anthropic_stream(self, resp, record=False):
+        content_blocks = []
+        thinking_parts = []
+        for evt in resp:
+            etype = evt.get("type", "")
+            if etype == "content_block_start":
+                block = evt.get("content_block", {}) or {}
+                idx = evt.get("index", len(content_blocks))
+                while len(content_blocks) <= idx:
+                    content_blocks.append(dict(block))
+            elif etype == "content_block_delta":
+                idx = evt.get("index", 0)
+                delta = evt.get("delta", {}) or {}
+                block = content_blocks[idx] if idx < len(content_blocks) else {}
+                dt = delta.get("type", "")
+                if dt == "text_delta":
+                    txt = delta.get("text", "")
+                    block["text"] = block.get("text", "") + txt
+                    thinking_parts.append(txt)
+                    yield ("chunk", txt)
+                elif dt == "thinking_delta":
+                    txt = delta.get("thinking", "")
+                    block["thinking"] = block.get("thinking", "") + txt
+                    thinking_parts.append(txt)
+                    yield ("chunk", txt)
+                elif dt == "input_json_delta":
+                    block["input"] = (block.get("input", "") or "") + delta.get("partial_json", "")
+                elif dt == "tool_use":
+                    # tools normally arrive via content_block_start/stop
+                    pass
+            elif etype == "message_stop":
+                break
+        built_tcs = []
+        for block in content_blocks:
+            if block.get("type") == "tool_use":
+                raw = block.get("input", "")
+                try:
+                    args = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    args = {}
+                block["input"] = args
+                built_tcs.append({
+                    "id": block.get("id"), "name": block.get("name"), "args": args,
+                })
+        thinking = "\n".join(p for p in thinking_parts if p).strip()
+        if record:
+            self.history.append({"role": "assistant", "content": content_blocks})
         yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
 
     @staticmethod
@@ -325,7 +373,15 @@ class LLMClient:
         delta = choices[0].get("delta")
         return isinstance(delta, dict)
 
-    # ---------- stateless streaming ----------
+    # ---------- OpenAI format (streaming) ----------
+    def _turn_openai_stream(self, user_text):
+        self.history.append({"role": "user", "content": user_text})
+        body = self._build_openai_body(self.history, stream=True)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        resp = self._post_stream(f"{self.api_base_url}/chat/completions",
+                                 headers=headers, body=body)
+        yield from self._parse_openai_stream(resp, record=True)
+
     def _stateless_openai_stream(self, system_text, board_text):
         messages = [
             {"role": "system", "content": system_text},
@@ -335,49 +391,7 @@ class LLMClient:
         headers = {"Authorization": f"Bearer {self.api_key}"}
         resp = self._post_stream(f"{self.api_base_url}/chat/completions",
                                  headers=headers, body=body)
-        content_parts = []
-        reasoning_parts = []
-        tool_calls_acc = {}
-        for evt in resp:
-            if not self._is_openai_chunk(evt):
-                continue
-            choices = evt.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {}) or {}
-            if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
-                yield ("chunk", delta["reasoning_content"])
-            if delta.get("content"):
-                content_parts.append(delta["content"])
-                yield ("chunk", delta["content"])
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
-                slot = tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                fn = tc.get("function", {}) or {}
-                if fn.get("name"):
-                    slot["name"] = fn["name"]
-                if fn.get("arguments"):
-                    slot["arguments"] += fn["arguments"]
-        content = "".join(content_parts)
-        reasoning = "".join(reasoning_parts)
-        thinking_parts = []
-        if reasoning:
-            thinking_parts.append(reasoning)
-        if content:
-            thinking_parts.append(content)
-        thinking = "\n".join(thinking_parts).strip()
-        built_tcs = []
-        for idx in sorted(tool_calls_acc.keys()):
-            slot = tool_calls_acc[idx]
-            try:
-                args = json.loads(slot["arguments"] or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            built_tcs.append({"id": slot["id"], "name": slot["name"], "args": args})
-        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
+        yield from self._parse_openai_stream(resp, record=False)
 
     def _stateless_anthropic_stream(self, system_text, board_text):
         body = {
@@ -395,51 +409,7 @@ class LLMClient:
             headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
             body=body,
         )
-        content_blocks = []
-        thinking_parts = []
-        for evt in resp:
-            etype = evt.get("type", "")
-            if etype == "content_block_start":
-                block = evt.get("content_block", {}) or {}
-                idx = evt.get("index", len(content_blocks))
-                while len(content_blocks) <= idx:
-                    content_blocks.append(dict(block))
-            elif etype == "content_block_delta":
-                idx = evt.get("index", 0)
-                delta = evt.get("delta", {}) or {}
-                block = content_blocks[idx] if idx < len(content_blocks) else {}
-                dt = delta.get("type", "")
-                if dt == "text_delta":
-                    txt = delta.get("text", "")
-                    block["text"] = block.get("text", "") + txt
-                    thinking_parts.append(txt)
-                    yield ("chunk", txt)
-                elif dt == "thinking_delta":
-                    txt = delta.get("thinking", "")
-                    block["thinking"] = block.get("thinking", "") + txt
-                    thinking_parts.append(txt)
-                    yield ("chunk", txt)
-                elif dt == "input_json_delta":
-                    block["input"] = (block.get("input", "") or "") + delta.get("partial_json", "")
-                elif dt == "tool_use":
-                    pass
-            elif etype == "message_stop":
-                break
-        built_tcs = []
-        for block in content_blocks:
-            if block.get("type") == "tool_use":
-                raw = block.get("input", "")
-                try:
-                    args = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    args = {}
-                block["input"] = args
-                built_tcs.append({
-                    "id": block.get("id"), "name": block.get("name"), "args": args,
-                })
-        thinking = "\n".join(p for p in thinking_parts if p).strip()
-        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
-
+        yield from self._parse_anthropic_stream(resp, record=False)
     # ---------- Anthropic format ----------
     def _turn_anthropic(self, user_text):
         self.history.append({"role": "user", "content": user_text})
@@ -498,53 +468,7 @@ class LLMClient:
                      "anthropic-version": "2023-06-01"},
             body=body,
         )
-        content_blocks = []
-        thinking_parts = []
-        tool_calls = []
-        for evt in resp:
-            etype = evt.get("type", "")
-            if etype == "content_block_start":
-                block = evt.get("content_block", {}) or {}
-                idx = evt.get("index", len(content_blocks))
-                while len(content_blocks) <= idx:
-                    content_blocks.append(dict(block))
-            elif etype == "content_block_delta":
-                idx = evt.get("index", 0)
-                delta = evt.get("delta", {}) or {}
-                block = content_blocks[idx] if idx < len(content_blocks) else {}
-                dt = delta.get("type", "")
-                if dt == "text_delta":
-                    txt = delta.get("text", "")
-                    block["text"] = block.get("text", "") + txt
-                    thinking_parts.append(txt)
-                    yield ("chunk", txt)
-                elif dt == "thinking_delta":
-                    txt = delta.get("thinking", "")
-                    block["thinking"] = block.get("thinking", "") + txt
-                    thinking_parts.append(txt)
-                    yield ("chunk", txt)
-                elif dt == "input_json_delta":
-                    block["input"] = (block.get("input", "") or "") + delta.get("partial_json", "")
-                elif dt == "tool_use":
-                    # tools normally arrive via content_block_start/stop
-                    pass
-            elif etype == "message_stop":
-                break
-        built_tcs = []
-        for block in content_blocks:
-            if block.get("type") == "tool_use":
-                raw = block.get("input", "")
-                try:
-                    args = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    args = {}
-                block["input"] = args
-                built_tcs.append({
-                    "id": block.get("id"), "name": block.get("name"), "args": args,
-                })
-        thinking = "\n".join(p for p in thinking_parts if p).strip()
-        self.history.append({"role": "assistant", "content": content_blocks})
-        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
+        yield from self._parse_anthropic_stream(resp, record=True)
 
     # ---------- record a tool result ----------
     def add_tool_result(self, tool_call_id, name, result_text):

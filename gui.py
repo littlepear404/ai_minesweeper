@@ -26,6 +26,7 @@ except Exception:
 
 from minesweeper import Minesweeper, DIFFICULTIES, NUMBER_COLORS
 from llm_client import LLMClient, LLMError
+from run_history import record as record_run, summarize as summarize_runs
 
 UI_FONT_SIZE = 14
 THINK_FONT_SIZE = 14
@@ -147,6 +148,10 @@ class App:
         self.continue_btn.pack(side=tk.LEFT, padx=8)
         self.edit_btn = ttk.Button(top, text="编辑配置", command=self.on_edit_config)
         self.edit_btn.pack(side=tk.LEFT, padx=8)
+        self.stats_btn = ttk.Button(top, text="查看战绩", command=self.on_show_stats)
+        self.stats_btn.pack(side=tk.LEFT, padx=8)
+        self.export_btn = ttk.Button(top, text="导出日志", command=self.on_export_log)
+        self.export_btn.pack(side=tk.LEFT, padx=8)
 
         body = ttk.Frame(self.root)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
@@ -202,6 +207,9 @@ class App:
         self.client.reset(SYSTEM_PROMPT + "\n\n当前难度: " + self.difficulty_var.get() +
                            f"\n棋盘尺寸: {self.game.width}x{self.game.height}, " +
                            f"雷数: {self.game.num_mines}")
+        self.game_start_ts = time.time()
+        self.move_count = 0
+        self.game_recorded = False
 
         self._clear_thinking()
         self._append_text(f"=== 新游戏开始: {self.difficulty_var.get()} " +
@@ -216,7 +224,17 @@ class App:
             return
         if self.game is None or self.game.state in ("won", "lost", "ready") or self.client is None:
             return
-        self._append_text("\n[继续(有状态模式)]\n", tag="sys")
+        # The stateful path keeps conversation history, but on_start reset it
+        # to just the system prompt -- so a bare "继续" had no context of
+        # the current board. Re-feed the live board snapshot as the first
+        # user turn so the model actually continues this game.
+        snapshot = (
+            "继续当前对局。以下是当前棋盘状态(row/col 从0开始, '.' 未翻开, "
+            "'F' 旗, 数字为已翻开雷数):\n" + self.game.to_text()
+            + "\n" + self.game.summary()
+        )
+        self.client.history.append({"role": "user", "content": snapshot})
+        self._append_text("\n[继续(有状态模式), 已载入当前棋盘]\n", tag="sys")
         self._begin_worker(stateless=False)
 
     def _begin_worker(self, stateless=True):
@@ -242,7 +260,33 @@ class App:
         self.stop_btn.config(state=tk.DISABLED)
         if self.game is not None and self.game.state == "playing":
             self.continue_btn.config(state=tk.NORMAL)
+            self._record_game("stopped")
         self.start_btn.config(state=tk.NORMAL)
+
+    def on_show_stats(self):
+        # Show a rolling summary of recorded games (run_history.jsonl).
+        messagebox.showinfo("战绩统计", summarize_runs())
+
+    def on_export_log(self):
+        # Save the right-hand thinking log to a UTF-8 text file.
+        content = self.thinking.get("1.0", tk.END).rstrip("\n")
+        if not content.strip():
+            messagebox.showinfo("导出日志", "当前没有可导出的内容。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All", "*.*")],
+            title="导出思考日志",
+            initialfile=f"llm_log_{self.difficulty_var.get()}.txt",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
+            messagebox.showinfo("导出日志", f"已保存到:\n{path}")
+        except OSError as e:
+            messagebox.showerror("导出失败", str(e))
 
     def on_edit_config(self):
         path = filedialog.askopenfilename(
@@ -323,6 +367,30 @@ class App:
         self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
         return "break"
 
+    def _record_game(self, result):
+        # Persist a finished-game record so model quality can be evaluated.
+        # Guard against double-recording (end handler + stop button).
+        if self.game_recorded:
+            return
+        self.game_recorded = True
+        if self.game is None or self.client is None:
+            return
+        try:
+            duration = time.time() - self.game_start_ts
+        except Exception:
+            duration = 0.0
+        record_run(
+            result,
+            difficulty=self.difficulty_var.get(),
+            width=self.game.width, height=self.game.height,
+            num_mines=self.game.num_mines,
+            model=self.client.model, provider=self.client.provider,
+            moves=self.move_count,
+            revealed=self.game.revealed_count,
+            duration_s=duration,
+            seed=(int(self.seed_var.get()) if self.seed_var.get().strip() else None),
+        )
+
     # -------------------------- thinking panel -------------------------- #
     def _clear_thinking(self):
         self.thinking.config(state=tk.NORMAL)
@@ -373,6 +441,7 @@ class App:
         elif kind == "end":
             self.running = False
             self.thinking_status_var.set("游戏结束")
+            self._record_game(self.game.state)
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             self.continue_btn.config(state=tk.DISABLED)
@@ -456,6 +525,7 @@ class App:
                     self._put("result", f"[跳过] 未知工具: {name}")
                     break
                 self._put("redraw", None)
+                self.move_count += 1
                 res = out.get("result")
                 self._put("result", self._format_tool_result(out, name, row, col))
                 autoflags = g.auto_flag_certain_mines() if name in ("reveal", "chord") else []

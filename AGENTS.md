@@ -95,11 +95,15 @@ use).
 
 ## Known limits / next steps
 
-- No persistent scoring or run history.
+- Run history is persisted to `run_history.jsonl` (one JSON record per
+  finished game: difficulty, size, model, provider, moves, revealed
+  count, duration, seed). The "查看战绩" button shows a rolling
+  win-rate/average summary via `run_history.summarize()`.
 - Tests live in `tests/` (`test_minesweeper.py`, `test_llm_client.py`); run with
   `python -m unittest tests.test_minesweeper tests.test_llm_client`.
   Covers game logic plus `llm_client` tool-result formatting, SSE chunk
   detection, streaming parse, and history trimming (mocked `requests`).
+  `tests/test_run_history.py` covers the JSONL persistence and summary.
 - LLM debugging requires a real API key in `llm_config.json` — deferred until
   the user provides one. With the placeholder key, `LLMClient.__init__` raises
   `LLMError`, so "开始/重启" shows a config-error dialog (expected).
