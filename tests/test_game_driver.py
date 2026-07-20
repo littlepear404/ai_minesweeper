@@ -89,8 +89,22 @@ class LoopTerminationTest(unittest.TestCase):
         repeat = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
         events = _collect(g, _FakeClient([repeat] * 50), move_delay=0,
                           max_no_action=10, stop_check=lambda: True)
-        # stop_check True at the very top -> immediate return, no "end" emit.
-        self.assertNotIn("end", [k for k, _ in events])
+        # stop_check True at the very top -> immediate abort, reported as a
+        # single "end" event with result "stopped" and zero moves.
+        ends = [p for k, p in events if k == "end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["result"], "stopped")
+        self.assertEqual(ends[0]["moves"], 0)
+
+    def test_end_payload_reports_moves(self):
+        # The run-history fix: "end" must carry the executed action count.
+        g = Minesweeper.from_preset("beginner")
+        first = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
+        events = _collect(g, _FakeClient([first] + [[]] * 10), move_delay=0,
+                          max_no_action=2, stop_check=lambda: False)
+        ends = [p for k, p in events if k == "end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["moves"], 1)
 
     def test_real_progress_keeps_going(self):
         # A first-move reveal that opens cells is real progress; the loop

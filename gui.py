@@ -146,7 +146,6 @@ class App:
                            f"\n棋盘尺寸: {self.game.width}x{self.game.height}, " +
                            f"雷数: {self.game.num_mines}")
         self.game_start_ts = time.time()
-        self.move_count = 0
         self.game_recorded = False
 
         self._clear_thinking()
@@ -194,12 +193,10 @@ class App:
         self.running = False
         self.thinking_status_var.set("空闲")
         self._append_text("\n[已停止]\n", tag="sys")
-        # stop permits continue; new game still allowed
+        # The worker notices the flag and emits a final ("end", {...}) event,
+        # which records the game and re-enables the buttons. Nothing to do
+        # here beyond flipping the flag.
         self.stop_btn.config(state=tk.DISABLED)
-        if self.game is not None and self.game.state == "playing":
-            self.continue_btn.config(state=tk.NORMAL)
-            self._record_game("stopped")
-        self.start_btn.config(state=tk.NORMAL)
 
     def on_show_stats(self):
         # Show a rolling summary of recorded games (run_history.jsonl).
@@ -305,7 +302,7 @@ class App:
         self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
         return "break"
 
-    def _record_game(self, result):
+    def _record_game(self, result, moves=0):
         # Persist a finished-game record so model quality can be evaluated.
         # Guard against double-recording (end handler + stop button).
         if self.game_recorded:
@@ -323,7 +320,7 @@ class App:
             width=self.game.width, height=self.game.height,
             num_mines=self.game.num_mines,
             model=self.client.model, provider=self.client.provider,
-            moves=self.move_count,
+            moves=moves,
             revealed=self.game.revealed_count,
             duration_s=duration,
             seed=(int(self.seed_var.get()) if self.seed_var.get().strip() else None),
@@ -378,11 +375,21 @@ class App:
             self._update_status()
         elif kind == "end":
             self.running = False
-            self.thinking_status_var.set("游戏结束")
-            self._record_game(self.game.state)
+            payload = payload or {}
+            result = payload.get("result") or (
+                self.game.state if self.game is not None else "stopped")
+            moves = payload.get("moves", 0)
+            self.thinking_status_var.set(
+                "游戏结束" if result in ("won", "lost") else "已停止")
+            self._record_game(result, moves)
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            self.continue_btn.config(state=tk.DISABLED)
+            # A stopped game can be resumed; a finished one cannot.
+            if result == "stopped" and self.game is not None \
+                    and self.game.state == "playing":
+                self.continue_btn.config(state=tk.NORMAL)
+            else:
+                self.continue_btn.config(state=tk.DISABLED)
             self._draw_board()
             self._update_status()
 

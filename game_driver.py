@@ -125,12 +125,19 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
     no_action = 0
     no_progress = 0  # rounds where the model returned calls but none executed
     last_summary = ""
+
+    def _end(result):
+        # Single exit signal: always carries the outcome and action count so
+        # callers (GUI run history, CLI batch stats) never have to guess.
+        emit("end", {"result": result, "moves": move_count})
+
     while True:
         if stop_check():
+            _end("stopped")
             return
         g = game
         if g.state in ("won", "lost"):
-            emit("end", None)
+            _end(g.state)
             return
         hint = ""
         if not g.first_move_done:
@@ -150,6 +157,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
             for kind, val in client.call_stateless_stream(system_prompt, snapshot):
                 if stop_check():
                     emit("think_end", None)
+                    _end("stopped")
                     return
                 if kind == "chunk":
                     emit("think_chunk", val)
@@ -159,7 +167,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
         except LLMError as e:
             emit("think_end", True)
             emit("error", f"[LLM 调用失败] {e}")
-            emit("end", None)
+            _end("error")
             return
         emit("think_end", True)
         emit("think_chunk", "\n")
@@ -169,7 +177,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
             emit("result", f"[模型未返回工具调用] 连续空轮 {no_action}")
             if no_action >= max_no_action:
                 emit("error", "连续多次空轮，自动停止。")
-                emit("end", None)
+                _end("stopped")
                 return
             continue
         no_action = 0
@@ -179,6 +187,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
         progressed = False  # did any call change the board this round?
         for i, tc in enumerate(tool_calls):
             if stop_check():
+                _end("stopped")
                 return
             name = tc.get("name")
             args = tc.get("args") or {}
@@ -186,7 +195,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
             if row is None or col is None:
                 skip_log.append(f"{name}(?,?)原因:缺少参数")
                 emit("result", f"[跳过] {name} 缺少参数")
-                break
+                continue
             emit("action", f">>> {name}(row={row}, col={col})")
             if name == "reveal":
                 out = g.reveal(row, col)
@@ -247,7 +256,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
             no_progress = 0
         if no_progress >= max_no_action:
             emit("error", "连续多次返回无效/无执行动作，自动停止。")
-            emit("end", None)
+            _end("stopped")
             return
         parts = []
         if action_log:
@@ -257,5 +266,5 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
         last_summary = ("\n\n" + "\n".join(parts)) if parts else ""
 
         if g.state in ("won", "lost"):
-            emit("end", None)
+            _end(g.state)
             return

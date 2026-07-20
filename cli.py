@@ -44,7 +44,9 @@ def _emit(kind, payload):
     elif kind == "redraw":
         pass  # headless: nothing to redraw
     elif kind == "end":
-        print("\n=== 游戏结束 ===", flush=True)
+        payload = payload or {}
+        print(f"\n=== 游戏结束: {payload.get('result', '?')} | "
+              f"动作数 {payload.get('moves', 0)} ===", flush=True)
 
 
 def _print_board(game):

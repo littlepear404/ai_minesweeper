@@ -8,3 +8,4 @@ llm_config.json
 llm_config.local.json
 *.secret
 *.key
+run_history.jsonl
