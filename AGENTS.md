@@ -10,51 +10,64 @@ pip install -r requirements.txt        # only `requests` beyond stdlib
 python main.py                          # launches the Tkinter GUI
 ```
 
-No build step, no tests yet. Verify changes with `python -m py_compile
+No build step. Verify changes with `python -m py_compile
 minesweeper.py llm_client.py gui.py main.py` and the smoke check below.
+Tests live in `tests/`; run the full suite with
+`python -m unittest tests.test_minesweeper tests.test_llm_client tests.test_run_history tests.test_game_driver`.
 
 ## Architecture
 
 - `minesweeper.py` — pure game logic. No I/O, no Tkinter. First click is
   always safe (3x3 safe zone generated on first reveal via `_place_mines`).
   Board state machine: `ready -> playing -> won|lost`. Use `Minesweeper.from_preset(name)`; presets live in `DIFFICULTIES` (beginner/intermediate/expert).
+  Also hosts the deterministic local solver: `auto_flag_certain_mines()`
+  (flag provable mines) and `auto_chord_certain_safe()` (chord provably
+  satisfied numbers). Both only trust flags in `self.certain_flags` — flags
+  placed via `toggle_flag` (LLM/manual guesses) never seed deductions, so
+  the solver is sound by induction and can never explode on a mis-flag.
 - `game_driver.py` — **tkinter-free** headless game loop. Holds
-  `SYSTEM_PROMPT`, `load_config()`, `_format_tool_result()`, and the core
-  `run_stateless_loop(game, client, emit, *, move_delay, max_no_action,
-  stop_check, system_prompt)`. `emit(kind, payload)` is the single
-  integration point; GUI and CLI are just different `emit` adapters. The loop
-  terminates on: empty tool-call rounds (`no_action`), all-skipped/no-progress
-  rounds (`no_progress` — covers the repeated-`nochange` infinite-loop trap),
-  game over, or `stop_check()` returning True. Keep `SYSTEM_PROMPT` in sync
-  with `Minesweeper.to_text_compact()`'s snapshot format.
+  `SYSTEM_PROMPT`, `load_config()`, `_format_tool_result()`, `_solver_step()`,
+  and the core `run_stateless_loop(game, client, emit, *, move_delay,
+  max_no_action, stop_check, system_prompt, solver_mode)`.
+  `emit(kind, payload)` is the single integration point; GUI and CLI are
+  just different `emit` adapters. With `solver_mode="assist"` each round
+  first runs `_solver_step` to fixpoint; while local deduction progresses
+  the LLM is NOT called (zero token cost) — the model is only consulted
+  when a guess or higher-level reasoning is needed. The loop terminates on:
+  empty tool-call rounds (`no_action`), all-skipped/no-progress rounds
+  (`no_progress` — covers the repeated-`nochange` infinite-loop trap),
+  game over, or `stop_check()` returning True. Every exit emits
+  `("end", {"result", "moves", "input_tokens", "output_tokens"})` — result
+  is `won|lost|stopped|error`. Per-round token usage is emitted as
+  `("usage", {...})`. Keep `SYSTEM_PROMPT` in sync with
+  `Minesweeper.to_text_compact()`'s snapshot format.
 - `cli.py` — headless entry point (`python -m cli`) for debugging the LLM
   loop without the GUI. Adapts `emit` to stdout and Ctrl-C to `stop_check`.
-- `gui.py` — Tkinter UI + the LLM driver thread. **Two worker paths**:
-  - `_run_loop_stateless` (default, for "开始/重启"): a thin delegate that
-    calls `run_stateless_loop(...)` from `game_driver.py`, passing
-    `self._put` as `emit` and `lambda: not self.running` as `stop_check`.
-    The actual loop logic lives in `game_driver.py` so it can be tested and
-    run from the CLI without Tkinter.
-  - `_run_loop_stateful` (for "继续"): legacy path that uses `client.turn_stream`,
-    `add_tool_result`, and `trim_history`. Preserves conversation context
-    across the paused game. NOTE: this legacy path still lacks the
-    `no_progress` guard and can loop on repeated `nochange`; prefer the
-    stateless driver for new work.
-  Both post `(kind, payload)` tuples to `self.cmd_queue`; the main thread
-  polls it every 100ms via `_poll_queue`/`_handle_cmd`.
-- `llm_client.py` — thin HTTP client. Three call styles:
-  - `turn()` / `turn_stream()` — stateful (append to `self.history`).
-  - `call_stateless_stream(system, board)` — builds fresh `messages=[system, user]`
-    every call, does NOT read/write `self.history`. Used by stateless worker.
-  Supports `provider: openai` (also sends `tool_temperature` when configured)
-  and `provider: anthropic`. Tools are `reveal`, `toggle_flag`, and `chord`
-  (defined in `COMMON_TOOLS`). `_should_omit_tool_choice` handles DeepSeek-V4
-  reasoning models that reject the `tool_choice` parameter.
+  Batch evaluation mode: `python -m cli -d intermediate --games 20
+  --seed-start 1000` plays N games quietly, records each to
+  `run_history.jsonl`, and prints a win-rate / token aggregate.
+- `gui.py` — Tkinter UI + the LLM driver thread. Single worker path:
+  `_run_loop_stateless` delegates to `run_stateless_loop(...)`, passing
+  `self._put` as `emit` and `lambda: not self.running` as `stop_check`.
+  "继续" simply re-enters the same loop with the live game object (the
+  loop is stateless, so the next snapshot carries the full board).
+  The worker posts `(kind, payload)` tuples to `self.cmd_queue`; the main
+  thread polls it every 100ms via `_poll_queue`/`_handle_cmd`.
+- `llm_client.py` — thin HTTP client, **stateless only**:
+  `call_stateless_stream(system, board)` builds fresh
+  `messages=[system, user]` every call. Supports `provider: openai`
+  (sends `tool_temperature` / `reasoning_effort` when configured, requests
+  `stream_options.include_usage`) and `provider: anthropic` (marks system
+  prompt + tools with `cache_control: ephemeral` so cached input tokens
+  bill at ~1/10 price). Tools are `reveal`, `toggle_flag`, and `chord`
+  (defined in `COMMON_TOOLS`, descriptions deliberately terse — the system
+  prompt carries the detail). `_should_omit_tool_choice` handles
+  DeepSeek-V4 reasoning models that reject the `tool_choice` parameter.
 - `main.py` — entrypoint, just import-guards Tkinter/requests then calls `gui.main()`.
 - `llm_config.json` — **the only** API config (key, base_url, model, tempo).
-  Tracked in git with a placeholder key; real keys are secrets and must never
-  be committed. `keep_recent_turns`, `move_delay`, `max_no_action_retries`
-  tune the game loop.
+  Git-ignored (only `llm_config.template.json` is tracked); real keys are
+  secrets and must never be committed. `move_delay`,
+  `max_no_action_retries`, `solver_mode` tune the game loop.
 
 ## Conventions that matter
 
@@ -66,8 +79,7 @@ minesweeper.py llm_client.py gui.py main.py` and the smoke check below.
   hidden neighbours of a revealed numbered cell when its flagged-neighbour
   count equals its number (classic minesweeper double-click). The program
   validates chord legality (flag count == number) before executing.
-  Coordinates are **0-indexed**; the system prompt states this and the board
-  text snapshot labels rows/cols. Don't add 1.
+  Coordinates are **0-indexed**; the system prompt states this. Don't add 1.
 - Board text: the stateless loop sends `Minesweeper.to_text_compact()` (a
   label-free per-row string, ~69% fewer tokens than `to_text()` on expert)
   as the LLM's whole view of the game; unrevealed = `.`, flags = `F`,
@@ -75,10 +87,13 @@ minesweeper.py llm_client.py gui.py main.py` and the smoke check below.
   coordinate lookup. `SYSTEM_PROMPT` lives in `game_driver.py` (kept deliberately
   terse (~half the original token cost) — if you change the snapshot
   format, keep `SYSTEM_PROMPT`'s board description in sync.
-- Auto-flag: `Minesweeper.auto_flag_certain_mines()` runs after every
-  `reveal`/`chord`. It flags any hidden neighbours of a number cell N where
-  `hidden+flagged == N` (iterate to fixpoint). The LLM is informed of this
-  via the system prompt; new `F`s appear in the next board snapshot.
+- Auto-flag / auto-chord (the local solver):
+  `Minesweeper.auto_flag_certain_mines()` runs after every `reveal`/`chord`,
+  and with `solver_mode="assist"` both it and `auto_chord_certain_safe()`
+  run to fixpoint before every LLM call. They only trust flags in
+  `certain_flags` (pure deduction); LLM/manual flags are guesses and never
+  seed new deductions. The LLM is informed of auto-flag via the system
+  prompt; new `F`s appear in the next board snapshot.
 - First-move safety is implemented lazily — mines are placed *after* the first
   `reveal`, excluding a 3x3 area around the clicked cell. Don't call
   `_place_mines` directly.
@@ -101,27 +116,34 @@ First should print `safe ... playing`; both tool counts should be `3`.
 
 `provider` (`openai`|`anthropic`), `api_base_url`, `api_key`, `model`,
 `temperature`, `max_tokens`, `request_timeout`, `move_delay` (seconds between
-LLM actions), `keep_recent_turns` (history window, 0 = keep all),
-`max_no_action_retries` (stop after N consecutive no-call turns). `cell_size`
-(optional, px) also lives here. `tool_temperature` (optional, sent as-is for
-OpenAI-compatible providers that support it; lower values bias towards tool
-use).
+LLM actions), `max_no_action_retries` (stop after N consecutive no-call
+turns), `solver_mode` (`assist` = local deterministic solver plays provable
+moves for free, LLM only called when stuck; `off` = LLM plays every step).
+`cell_size` (optional, px) also lives here. `tool_temperature` (optional,
+sent as-is for OpenAI-compatible providers that support it; lower values
+bias towards tool use). `reasoning_effort` (optional, e.g. `"low"`;
+pass-through for OpenAI reasoning models to cut thinking-token cost —
+only sent when explicitly configured since strict servers may reject it).
 
 ## Known limits / next steps
 
 - Run history is persisted to `run_history.jsonl` (one JSON record per
   finished game: difficulty, size, model, provider, moves, revealed
-  count, duration, seed). The "查看战绩" button shows a rolling
+  count, duration, seed, and input/output token totals when the provider
+  reports usage). The "查看战绩" button shows a rolling
   win-rate/average summary via `run_history.summarize()`.
 - Tests live in `tests/`; run the full suite with
   `python -m unittest tests.test_minesweeper tests.test_llm_client tests.test_run_history tests.test_game_driver`.
-  Covers game logic, `llm_client` tool-result formatting, SSE chunk
-  detection, streaming parse, history trimming (mocked `requests`),
-  run-history JSONL persistence/summary, and `game_driver` loop-termination
-  guards (including the repeated-`nochange` infinite-loop regression).
+  Covers game logic, solver soundness (certain-flag induction, wrong-flag
+  auto-chord guard), `llm_client` SSE chunk detection / streaming parse /
+  usage extraction / request-body shape (mocked `requests`), run-history
+  JSONL persistence/summary, and `game_driver` loop-termination guards
+  (including the repeated-`nochange` infinite-loop regression) plus
+  solver-assist behaviour.
 - The game loop is decoupled from the GUI: `python -m cli` runs the same
   `run_stateless_loop` headlessly (no Tkinter) so the LLM's behaviour, token
-  usage, and tool-call parsing can be debugged from a terminal.
+  usage, and tool-call parsing can be debugged from a terminal; `--games N`
+  gives a batch benchmark harness.
 - LLM debugging requires a real API key in `llm_config.json` — deferred until
   the user provides one. With the placeholder key, `LLMClient.__init__` raises
   `LLMError`, so "开始/重启" shows a config-error dialog (expected).

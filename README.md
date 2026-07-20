@@ -54,8 +54,8 @@ cp llm_config.template.json llm_config.json
   "max_tokens": 1024,
   "request_timeout": 120,
   "move_delay": 0.6,
-  "keep_recent_turns": 30,
   "max_no_action_retries": 10,
+  "solver_mode": "assist",
   "cell_size": 32
 }
 ```
@@ -72,8 +72,8 @@ DeepSeek 示例：
   "max_tokens": 1024,
   "request_timeout": 120,
   "move_delay": 0.6,
-  "keep_recent_turns": 30,
   "max_no_action_retries": 10,
+  "solver_mode": "assist",
   "cell_size": 32
 }
 ```
@@ -92,8 +92,8 @@ DeepSeek 示例：
   "max_tokens": 1024,
   "request_timeout": 120,
   "move_delay": 0.6,
-  "keep_recent_turns": 30,
   "max_no_action_retries": 10,
+  "solver_mode": "assist",
   "cell_size": 32
 }
 ```
@@ -108,8 +108,9 @@ DeepSeek 示例：
 - `max_tokens`: 单次模型回复的最大 token 数。
 - `request_timeout`: API 请求超时时间，单位为秒。
 - `move_delay`: 每一步动作后的等待时间，单位为秒，方便观察 AI 操作。
-- `keep_recent_turns`: 保留的最近对话轮数，`0` 表示不裁剪历史。
 - `max_no_action_retries`: 连续没有工具调用多少次后停止本局。
+- `solver_mode`: `assist`（默认）表示先由本地确定性求解器免费完成所有可推导的步骤，只在需要猜测时才调用 LLM，显著降低 token 消耗；`off` 表示每一步都交给 LLM。
+- `reasoning_effort`: 可选，如 `"low"`，仅对支持该参数的 OpenAI 推理模型透传，用于压缩思考 token。
 - `cell_size`: 棋盘格子大小，单位为像素。
 
 ## 运行程序
@@ -121,6 +122,20 @@ python main.py
 ```
 
 启动后点击“开始/重启”，模型会根据当前棋盘自动调用工具执行扫雷动作。
+
+## 无头模式与批量评测
+
+不启动 GUI，直接在终端运行同一套游戏循环：
+
+```bash
+python -m cli -d beginner --seed 123
+```
+
+批量评测（静默连跑 N 局，逐局写入 `run_history.jsonl`，最后输出胜率与 token 汇总）：
+
+```bash
+python -m cli -d intermediate --games 20 --seed-start 1000
+```
 
 ## 注意事项
 
