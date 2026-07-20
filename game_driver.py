@@ -201,8 +201,7 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
         if not g.first_move_done:
             hint = "\n(第一步: 首点周围永远安全, 推荐中心附近)"
         snapshot = (
-            "棋盘(每行一串, 行从上到下, 列从左到右, 索引0开始; "
-            "'.' 未翻开, 'F' 旗, '0'-'8' 已翻开雷数):\n"
+            "棋盘:\n"
             + g.to_text_compact() + "\n" + g.summary()
             + hint + last_summary
         )

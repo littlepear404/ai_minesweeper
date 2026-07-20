@@ -148,5 +148,37 @@ class TestAnthropicStreamParse(unittest.TestCase):
                          {"input_tokens": 200, "output_tokens": 30})
 
 
+class TestRequestBodies(unittest.TestCase):
+    def _capture_body(self, client):
+        sent = {}
+
+        def fake_post(url, headers, body):
+            sent["body"] = body
+            return iter([])
+
+        with mock.patch.object(client, "_post_stream", side_effect=fake_post):
+            for _ in client.call_stateless_stream("sys", "board"):
+                pass
+        return sent["body"]
+
+    def test_openai_body_stream_options_and_reasoning_effort(self):
+        c = make_client(reasoning_effort="low")
+        body = self._capture_body(c)
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+        self.assertEqual(body["reasoning_effort"], "low")
+
+    def test_openai_body_omits_reasoning_effort_by_default(self):
+        body = self._capture_body(make_client())
+        self.assertNotIn("reasoning_effort", body)
+
+    def test_anthropic_body_marks_prompt_cache(self):
+        body = self._capture_body(make_client(provider="anthropic"))
+        self.assertEqual(body["system"][0]["cache_control"],
+                         {"type": "ephemeral"})
+        self.assertEqual(body["tools"][-1]["cache_control"],
+                         {"type": "ephemeral"})
+
+
 if __name__ == "__main__":
     unittest.main()

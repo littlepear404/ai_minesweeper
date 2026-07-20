@@ -9,13 +9,12 @@ import requests
 
 
 # Common tool definitions (provider-agnostic). Converted per provider below.
+# Descriptions are kept terse on purpose: the system prompt already explains
+# the tools in detail, and this schema is re-sent on every single call.
 COMMON_TOOLS = [
     {
         "name": "reveal",
-        "description": (
-            "翻开一个格子。若该格是雷则游戏失败(输)；若是数字格则显示周围8格中的雷数；"
-            "若是空白(0)格会自动展开相邻连续的安全区域。坐标 row/col 均从0开始。"
-        ),
+        "description": "翻开格子。雷则输; 数字格显示周围雷数; 0格自动展开相邻安全区。坐标0-index。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -27,10 +26,7 @@ COMMON_TOOLS = [
     },
     {
         "name": "toggle_flag",
-        "description": (
-            "切换一个未翻开格子的插旗状态(已插旗则取消，未插旗则插旗)。"
-            "用于标记你认为是雷的格子，避免误翻。coordinate row/col 均从0开始。"
-        ),
+        "description": "切换未翻开格的插旗状态(标记/取消疑雷)。坐标0-index。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -43,10 +39,8 @@ COMMON_TOOLS = [
     {
         "name": "chord",
         "description": (
-            "对一个已翻开的数字格执行双击(chord)。当该数字格周围已插旗数 等于 "
-            "该数字时，会一次性翻开其周围所有未翻开且未插旗的格子。若你标记的"
-            "雷有误，双击会踩雷导致游戏失败(与人类双击同样规则)。这能一步推进"
-            "多个安全格，强烈推荐在确定雷已标对时使用。coordinate row/col 均从0开始。"
+            "双击已翻开数字格: 周围旗数==该数字时一次翻开周围未翻开未插旗格; "
+            "旗标错则踩雷输。坐标0-index。"
         ),
         "parameters": {
             "type": "object",
@@ -116,6 +110,11 @@ class LLMClient:
         self.tool_choice = config.get("tool_choice", "required")
         self.omit_tool_choice = self._should_omit_tool_choice(config)
         self.tool_temperature = config.get("tool_temperature")
+        # Optional pass-through for OpenAI reasoning models (o-series/GPT-5):
+        # "minimal"|"low"|"medium"|"high". Lower = fewer (cheaper) thinking
+        # tokens. Ignored by servers that do not support it... strict ones
+        # may reject it, so it is only sent when explicitly configured.
+        self.reasoning_effort = config.get("reasoning_effort")
         if self.provider not in ("openai", "anthropic"):
             raise LLMError(f"不支持的 provider: {self.provider}")
         if not self.api_base_url:
@@ -154,6 +153,8 @@ class LLMClient:
             body["stream_options"] = {"include_usage": True}
         if self.tool_temperature is not None:
             body["tool_temperature"] = self.tool_temperature
+        if self.reasoning_effort is not None:
+            body["reasoning_effort"] = self.reasoning_effort
         return body
 
     # ---------- shared streaming parsers ----------
@@ -326,11 +327,19 @@ class LLMClient:
         yield from self._parse_openai_stream(resp)
 
     def _stateless_anthropic_stream(self, system_text, board_text):
+        # Prompt caching: the system prompt and tool list are a stable
+        # prefix re-sent on every call; marking them ephemeral lets
+        # Anthropic bill cached input tokens at ~1/10 price on hits.
+        tools = build_anthropic_tools()
+        if tools:
+            tools[-1] = {**tools[-1],
+                         "cache_control": {"type": "ephemeral"}}
         body = {
             "model": self.model,
-            "system": system_text,
+            "system": [{"type": "text", "text": system_text,
+                        "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": board_text}],
-            "tools": build_anthropic_tools(),
+            "tools": tools,
             "tool_choice": {"type": "any" if self.tool_choice == "required" else "auto"},
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
