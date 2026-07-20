@@ -106,7 +106,8 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
         onto its thread-safe command queue; a CLI adapter just prints them.
         Recognised ``kind`` values: ``think_start``, ``think_chunk``,
         ``think_end``, ``thinking``, ``action``, ``result``, ``error``,
-        ``redraw``, ``end``.
+        ``usage``, ``redraw``, ``end``. ``end`` always carries a dict
+        payload: ``{"result", "moves", "input_tokens", "output_tokens"}``.
     move_delay : float
         Seconds to sleep between executed actions.
     max_no_action : int
@@ -125,11 +126,15 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
     no_action = 0
     no_progress = 0  # rounds where the model returned calls but none executed
     last_summary = ""
+    usage_in = 0
+    usage_out = 0
 
     def _end(result):
-        # Single exit signal: always carries the outcome and action count so
-        # callers (GUI run history, CLI batch stats) never have to guess.
-        emit("end", {"result": result, "moves": move_count})
+        # Single exit signal: always carries the outcome, action count and
+        # token totals so callers (GUI run history, CLI batch stats) never
+        # have to guess.
+        emit("end", {"result": result, "moves": move_count,
+                     "input_tokens": usage_in, "output_tokens": usage_out})
 
     while True:
         if stop_check():
@@ -164,6 +169,12 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
                     thinking += val
                 elif kind == "final":
                     tool_calls = val.get("tool_calls") or []
+                    u = val.get("usage")
+                    if u:
+                        usage_in += u.get("input_tokens") or 0
+                        usage_out += u.get("output_tokens") or 0
+                        emit("usage", {"input_tokens": u.get("input_tokens"),
+                                       "output_tokens": u.get("output_tokens")})
         except LLMError as e:
             emit("think_end", True)
             emit("error", f"[LLM 调用失败] {e}")

@@ -302,7 +302,8 @@ class App:
         self.canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
         return "break"
 
-    def _record_game(self, result, moves=0):
+    def _record_game(self, result, moves=0, input_tokens=None,
+                     output_tokens=None):
         # Persist a finished-game record so model quality can be evaluated.
         # Guard against double-recording (end handler + stop button).
         if self.game_recorded:
@@ -324,6 +325,8 @@ class App:
             revealed=self.game.revealed_count,
             duration_s=duration,
             seed=(int(self.seed_var.get()) if self.seed_var.get().strip() else None),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     # -------------------------- thinking panel -------------------------- #
@@ -370,6 +373,11 @@ class App:
             self._append_text(payload + "\n", tag="res")
         elif kind == "error":
             self._append_text(payload + "\n", tag="err")
+        elif kind == "usage":
+            payload = payload or {}
+            self._append_text(
+                f"  [tokens] 输入 {payload.get('input_tokens')} / "
+                f"输出 {payload.get('output_tokens')}\n", tag="res")
         elif kind == "redraw":
             self._draw_board()
             self._update_status()
@@ -381,7 +389,9 @@ class App:
             moves = payload.get("moves", 0)
             self.thinking_status_var.set(
                 "游戏结束" if result in ("won", "lost") else "已停止")
-            self._record_game(result, moves)
+            self._record_game(result, moves,
+                              input_tokens=payload.get("input_tokens"),
+                              output_tokens=payload.get("output_tokens"))
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             # A stopped game can be resumed; a finished one cannot.

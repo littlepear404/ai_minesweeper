@@ -81,6 +81,20 @@ class LLMError(Exception):
     pass
 
 
+def _norm_openai_usage(raw):
+    """Normalize an OpenAI-style usage chunk to {input_tokens, output_tokens}.
+
+    Returns None when no usable numbers are present.
+    """
+    if not isinstance(raw, dict):
+        return None
+    inp = raw.get("prompt_tokens")
+    out = raw.get("completion_tokens")
+    if inp is None and out is None:
+        return None
+    return {"input_tokens": inp, "output_tokens": out}
+
+
 class LLMClient:
     def __init__(self, config):
         self.provider = config.get("provider", "openai").lower()
@@ -171,6 +185,8 @@ class LLMClient:
             body["tool_choice"] = self.tool_choice
         if stream:
             body["stream"] = True
+            # Ask for a final usage chunk so token costs can be tracked.
+            body["stream_options"] = {"include_usage": True}
         if self.tool_temperature is not None:
             body["tool_temperature"] = self.tool_temperature
         return body
@@ -223,7 +239,13 @@ class LLMClient:
         content_parts = []
         reasoning_parts = []
         tool_calls_acc = {}  # index -> dict
+        usage = None
         for evt in resp:
+            # With stream_options.include_usage the server sends a final
+            # chunk with empty choices and a usage payload.
+            if isinstance(evt, dict) and evt.get("usage"):
+                usage = evt["usage"]
+                continue
             if not self._is_openai_chunk(evt):
                 continue
             choices = evt.get("choices") or []
@@ -270,14 +292,25 @@ class LLMClient:
         if record:
             self.history.append(self._build_openai_assistant_message(
                 content=content, reasoning=reasoning, tool_calls=raw_tcs))
-        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
+        yield ("final", {"thinking": thinking, "tool_calls": built_tcs,
+                         "usage": _norm_openai_usage(usage)})
 
     def _parse_anthropic_stream(self, resp, record=False):
         content_blocks = []
         thinking_parts = []
+        usage_in = None
+        usage_out = None
         for evt in resp:
             etype = evt.get("type", "")
-            if etype == "content_block_start":
+            if etype == "message_start":
+                u = (evt.get("message") or {}).get("usage") or {}
+                usage_in = u.get("input_tokens", usage_in)
+                usage_out = u.get("output_tokens", usage_out)
+            elif etype == "message_delta":
+                u = evt.get("usage") or {}
+                # output_tokens here is cumulative; keep the latest value.
+                usage_out = u.get("output_tokens", usage_out)
+            elif etype == "content_block_start":
                 block = evt.get("content_block", {}) or {}
                 idx = evt.get("index", len(content_blocks))
                 while len(content_blocks) <= idx:
@@ -319,7 +352,11 @@ class LLMClient:
         thinking = "\n".join(p for p in thinking_parts if p).strip()
         if record:
             self.history.append({"role": "assistant", "content": content_blocks})
-        yield ("final", {"thinking": thinking, "tool_calls": built_tcs})
+        usage = None
+        if usage_in is not None or usage_out is not None:
+            usage = {"input_tokens": usage_in, "output_tokens": usage_out}
+        yield ("final", {"thinking": thinking, "tool_calls": built_tcs,
+                         "usage": usage})
 
     @staticmethod
     def _build_openai_assistant_message(content=None, reasoning=None, tool_calls=None):

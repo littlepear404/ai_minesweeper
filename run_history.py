@@ -14,13 +14,14 @@ HISTORY_PATH = "run_history.jsonl"
 
 def record(result, *, difficulty, width, height, num_mines,
             model, provider, moves, revealed, duration_s,
-            seed=None, note=None):
+            seed=None, note=None, input_tokens=None, output_tokens=None):
     """Append one finished-game record. Returns the record dict (also written).
 
-    result: "won" | "lost" | "stopped"
+    result: "won" | "lost" | "stopped" | "error"
     moves:   number of executed tool actions
     revealed: number of safe cells revealed at game end
     duration_s: wall-clock seconds elapsed for the game
+    input_tokens/output_tokens: optional LLM token totals for the game
     """
     rec = {
         "ts": int(time.time()),
@@ -35,6 +36,10 @@ def record(result, *, difficulty, width, height, num_mines,
         "duration_s": round(duration_s, 3),
         "seed": seed,
     }
+    if input_tokens is not None:
+        rec["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        rec["output_tokens"] = output_tokens
     if note:
         rec["note"] = note
     _append(rec)
@@ -81,8 +86,15 @@ def summarize(records=None):
     stopped = n - won - lost
     avg_moves = sum((r.get("moves", 0) for r in records)) / n
     avg_dur = sum((r.get("duration_s", 0) for r in records)) / n
-    return (
+    text = (
         f"对局 {n} 局 | 胜 {won} ({won*100//n}%) | "
         f"负 {lost} | 中止 {stopped} | "
         f"平均动作 {avg_moves:.1f} | 平均用时 {avg_dur:.1f}s"
     )
+    tok = [r for r in records if r.get("input_tokens") is not None]
+    if tok:
+        avg_in = sum(r.get("input_tokens") or 0 for r in tok) / len(tok)
+        avg_out = sum(r.get("output_tokens") or 0 for r in tok) / len(tok)
+        text += (f"\n含 token 统计的 {len(tok)} 局: "
+                 f"平均输入 {avg_in:.0f} / 输出 {avg_out:.0f} tokens")
+    return text

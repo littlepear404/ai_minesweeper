@@ -172,6 +172,50 @@ class TestStatelessStreamParse(unittest.TestCase):
         self.assertEqual(len(final["tool_calls"]), 1)
         self.assertEqual(final["tool_calls"][0]["args"], {"row": 2, "col": 3})
 
+    def test_openai_usage_chunk_captured(self):
+        # stream_options.include_usage -> final chunk carries usage, no delta.
+        events = [
+            {"choices": [{"delta": {"content": "hi"}}]},
+            {"choices": [], "usage": {"prompt_tokens": 123,
+                                      "completion_tokens": 45,
+                                      "total_tokens": 168}},
+        ]
+        chunks, final = self._fake_stream(events)
+        self.assertEqual(final["usage"],
+                         {"input_tokens": 123, "output_tokens": 45})
+
+    def test_no_usage_yields_none(self):
+        events = [{"choices": [{"delta": {"content": "hi"}}]}]
+        chunks, final = self._fake_stream(events)
+        self.assertIsNone(final["usage"])
+
+
+class TestAnthropicStreamParse(unittest.TestCase):
+    def _fake_stream(self, events):
+        c = make_client(provider="anthropic")
+        with mock.patch.object(c, "_post_stream", return_value=iter(events)):
+            final = None
+            for kind, val in c.call_stateless_stream("sys", "board"):
+                if kind == "final":
+                    final = val
+        return final
+
+    def test_usage_from_message_events(self):
+        events = [
+            {"type": "message_start",
+             "message": {"usage": {"input_tokens": 200, "output_tokens": 1}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": "go"}},
+            {"type": "message_delta",
+             "usage": {"output_tokens": 30}},
+            {"type": "message_stop"},
+        ]
+        final = self._fake_stream(events)
+        self.assertEqual(final["usage"],
+                         {"input_tokens": 200, "output_tokens": 30})
+
 
 if __name__ == "__main__":
     unittest.main()
