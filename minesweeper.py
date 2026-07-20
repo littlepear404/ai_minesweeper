@@ -38,6 +38,10 @@ class Minesweeper:
         self.numbers = [[0] * width for _ in range(height)]
         self.revealed = [[False] * width for _ in range(height)]
         self.flagged = [[False] * width for _ in range(height)]
+        # Flags derived purely by local deduction (auto_flag_certain_mines).
+        # Only these are trusted by auto_chord_certain_safe; a flag placed
+        # via toggle_flag (e.g. by the LLM) is never treated as certain.
+        self.certain_flags = set()
         self.explode_cell = None
         self.first_move_done = False
         self.revealed_count = 0
@@ -139,6 +143,9 @@ class Minesweeper:
             # allow flagging even before first reveal (no mine placement needed)
             self.state = "playing"
         self.flagged[r][c] = not self.flagged[r][c]
+        # A manually toggled flag is a guess, not a deduction: it must not
+        # seed the certain-flag set the safe auto-chord relies on.
+        self.certain_flags.discard((r, c))
         return {"result": "flag" if self.flagged[r][c] else "unflag", "cell": (r, c)}
 
     def chord(self, r, c):
@@ -202,10 +209,17 @@ class Minesweeper:
         return self.revealed_count == total_cells - self.num_mines
 
     def auto_flag_certain_mines(self):
-        """Scan revealed numbered cells; for each, if flags + hidden ==
-        number (and hidden>0), all those hidden neighbors are certainly
-        mines -> flag them. Iterate to fixpoint. Returns list of newly
-        flagged (r, c) (order of discovery, deduped).
+        """Flag neighbours that are provably mines, by pure local deduction.
+
+        For a revealed number cell N: let ``known`` be its neighbours already
+        in ``certain_flags`` and ``unknown`` its remaining hidden neighbours.
+        When ``known + len(unknown) == N`` every unknown cell is certainly a
+        mine, so flag it and mark it certain. Iterate to fixpoint.
+
+        Only previously-derived certain flags count as ``known`` -- a flag
+        placed by hand/LLM (toggle_flag) is a guess and never seeds new
+        deductions, so the whole certain_flags set stays sound by induction.
+        Returns list of newly flagged (r, c) (order of discovery, deduped).
         """
         if self.state in ("won", "lost") or not self.first_move_done:
             return []
@@ -223,23 +237,71 @@ class Minesweeper:
                     n = self.numbers[r][c]
                     if n == 0:
                         continue
-                    hidden = []
-                    flagged = 0
+                    unknown = []
+                    known = 0
                     for nr, nc in self._neighbors(r, c):
                         if self.revealed[nr][nc]:
                             continue
-                        if self.flagged[nr][nc]:
-                            flagged += 1
+                        if (nr, nc) in self.certain_flags:
+                            known += 1
                         else:
-                            hidden.append((nr, nc))
-                    if hidden and (flagged + len(hidden)) == n:
-                        for (hr, hc) in hidden:
+                            unknown.append((nr, nc))
+                    if unknown and (known + len(unknown)) == n:
+                        for (hr, hc) in unknown:
                             self.flagged[hr][hc] = True
+                            self.certain_flags.add((hr, hc))
                             if (hr, hc) not in seen:
                                 seen.add((hr, hc))
                                 newly.append((hr, hc))
                             changed = True
         return newly
+
+    def auto_chord_certain_safe(self):
+        """Chord revealed numbers whose mines are all certainly flagged.
+
+        The dual of auto_flag_certain_mines: when a number cell's flagged
+        neighbour count equals its number AND every one of those flags is in
+        ``certain_flags`` (pure deduction, no LLM guesses), all its remaining
+        hidden neighbours are provably safe, so chord it. Iterate to
+        fixpoint. This can never explode on a model's mis-flag -- such cells
+        are simply skipped. Returns list of chorded (r, c), in order.
+        """
+        if self.state in ("won", "lost") or not self.first_move_done:
+            return []
+        chorded = []
+        guard = 0
+        while guard < 64:
+            guard += 1
+            progressed = False
+            for r in range(self.height):
+                for c in range(self.width):
+                    if self.state in ("won", "lost"):
+                        return chorded
+                    if not self.revealed[r][c] or self.mines[r][c]:
+                        continue
+                    n = self.numbers[r][c]
+                    if n == 0:
+                        continue
+                    flagged = 0
+                    hidden_unflagged = 0
+                    all_certain = True
+                    for nr, nc in self._neighbors(r, c):
+                        if self.revealed[nr][nc]:
+                            continue
+                        if self.flagged[nr][nc]:
+                            flagged += 1
+                            if (nr, nc) not in self.certain_flags:
+                                all_certain = False
+                        else:
+                            hidden_unflagged += 1
+                    if hidden_unflagged and flagged == n and all_certain:
+                        out = self.chord(r, c)
+                        if out.get("result") in ("safe", "won"):
+                            chorded.append((r, c))
+                            progressed = True
+            if not progressed:
+                break
+        return chorded
 
     def cell_symbol(self, r, c):
         if self.revealed[r][c]:

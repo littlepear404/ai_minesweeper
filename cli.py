@@ -100,6 +100,7 @@ def _play_one(game, client, cfg, stop_event, verbose):
         max_no_action=cfg.get("max_no_action_retries", 10),
         stop_check=stop_event.is_set,
         system_prompt=SYSTEM_PROMPT,
+        solver_mode=cfg.get("solver_mode", "assist"),
     )
     return end_sink[0] if end_sink else {"result": "stopped", "moves": 0}
 
@@ -112,6 +113,8 @@ def main(argv=None):
     parser.add_argument("-c", "--config", default="llm_config.json")
     parser.add_argument("--move-delay", type=float, default=None)
     parser.add_argument("--max-no-action", type=int, default=None)
+    parser.add_argument("--solver", choices=["off", "assist"], default=None,
+                        help="local deterministic solver mode (default: config)")
     parser.add_argument("--games", type=int, default=1,
                         help="batch mode: number of games to play")
     parser.add_argument("--seed-start", type=int, default=None,
@@ -123,6 +126,8 @@ def main(argv=None):
         cfg["move_delay"] = args.move_delay
     if args.max_no_action is not None:
         cfg["max_no_action_retries"] = args.max_no_action
+    if args.solver is not None:
+        cfg["solver_mode"] = args.solver
 
     try:
         client = LLMClient(cfg)
@@ -138,7 +143,8 @@ def main(argv=None):
     # ---------------- batch mode ----------------
     if args.games > 1:
         print(f"=== 批量评测: {args.games} 局 {args.difficulty} | "
-              f"模型 {client.model} ({client.provider}) ===")
+              f"模型 {client.model} ({client.provider}) | "
+              f"solver={cfg.get('solver_mode', 'assist')} ===")
         results = []
         for i in range(args.games):
             if stop_event.is_set():

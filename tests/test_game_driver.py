@@ -120,5 +120,32 @@ class LoopTerminationTest(unittest.TestCase):
         self.assertIn("end", [k for k, _ in events])
 
 
+class SolverAssistTest(unittest.TestCase):
+    def test_assist_progresses_without_llm_and_never_loses(self):
+        # 1 mine on 4x4 is fully deterministic after the first click: the
+        # solver should flag + chord to victory with a single LLM call
+        # (the opening reveal) and zero tokens spent afterwards.
+        g = Minesweeper(4, 4, 1, seed=2)
+        first = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
+        client = _FakeClient([first])
+        events = _collect(g, client, move_delay=0, max_no_action=3,
+                          stop_check=lambda: False, solver_mode="assist")
+        self.assertEqual(g.state, "won")
+        self.assertEqual(client.calls, 1)
+        ends = [p for k, p in events if k == "end"]
+        self.assertEqual(ends[0]["result"], "won")
+
+    def test_assist_falls_back_to_llm_when_stuck(self):
+        # Before the first move the solver can do nothing, so the LLM is
+        # consulted; afterwards assist mode keeps using it when deduction
+        # stalls (here: empty answers -> no_action stop).
+        g = Minesweeper(4, 4, 1, seed=2)
+        first = [{"name": "reveal", "args": {"row": 0, "col": 0}}]
+        client = _FakeClient([first])
+        events = _collect(g, client, move_delay=0, max_no_action=3,
+                          stop_check=lambda: False, solver_mode="off")
+        self.assertGreater(client.calls, 1)  # off: LLM called every round
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -85,9 +85,29 @@ def _format_tool_result(out, name, row, col):
     return f"  -> {out}"
 
 
+def _solver_step(game):
+    """Run local deterministic deduction to fixpoint.
+
+    Alternates auto_flag_certain_mines / auto_chord_certain_safe until
+    neither makes progress. Returns (flagged_cells, chorded_cells).
+    Every move made here is provably sound, so it never loses the game.
+    """
+    total_flags, total_chords = [], []
+    guard = 0
+    while guard < 64:
+        guard += 1
+        f = game.auto_flag_certain_mines()
+        c = game.auto_chord_certain_safe()
+        total_flags += f
+        total_chords += c
+        if (not f and not c) or game.state in ("won", "lost"):
+            break
+    return total_flags, total_chords
+
+
 def run_stateless_loop(game, client, emit, *, move_delay=0.6,
                        max_no_action=10, stop_check=None,
-                       system_prompt=SYSTEM_PROMPT):
+                       system_prompt=SYSTEM_PROMPT, solver_mode="off"):
     """Drive the LLM through a full stateless game of Minesweeper.
 
     The loop sends ``SYSTEM_PROMPT`` + the current compact board snapshot on
@@ -119,6 +139,12 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
     system_prompt : str
         The prompt handed to the model each turn. Kept in sync with the
         board snapshot format produced by ``Minesweeper.to_text_compact``.
+    solver_mode : str
+        ``"off"`` (default) asks the LLM every round. ``"assist"`` first
+        runs the local deterministic solver (``_solver_step``); while it
+        keeps making provably-sound progress the LLM is not called at all,
+        so the model is only consulted (and billed) when a guess or
+        higher-level reasoning is actually needed.
     """
     if stop_check is None:
         stop_check = lambda: False
@@ -144,6 +170,33 @@ def run_stateless_loop(game, client, emit, *, move_delay=0.6,
         if g.state in ("won", "lost"):
             _end(g.state)
             return
+
+        # ------ deterministic solver (assist mode) ------
+        # Free, instant and provably safe: while local deduction keeps
+        # progressing, skip the LLM call entirely.
+        if solver_mode == "assist":
+            flags, chords = _solver_step(g)
+            if flags or chords:
+                no_action = 0
+                no_progress = 0
+                move_count += len(chords)
+                if flags:
+                    cells = ", ".join(f"({r},{c})" for r, c in flags[:20])
+                    more = f" 等{len(flags)}格" if len(flags) > 20 else ""
+                    emit("result",
+                         f"  [自动求解] 确定雷插旗 {len(flags)} 格: {cells}{more}")
+                if chords:
+                    cells = ", ".join(f"({r},{c})" for r, c in chords[:20])
+                    more = f" 等{len(chords)}处" if len(chords) > 20 else ""
+                    emit("action",
+                         f">>> solver: 确定安全, 自动双击 {len(chords)} 处: {cells}{more}")
+                emit("redraw", None)
+                if g.state in ("won", "lost"):
+                    _end(g.state)
+                    return
+                time.sleep(move_delay)
+                continue
+
         hint = ""
         if not g.first_move_done:
             hint = "\n(第一步: 首点周围永远安全, 推荐中心附近)"

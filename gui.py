@@ -43,6 +43,7 @@ class App:
         self.cell_size = self.cfg.get("cell_size", 32)
         self.move_delay = self.cfg.get("move_delay", 0.6)
         self.max_no_action = self.cfg.get("max_no_action_retries", 10)
+        self.solver_mode = self.cfg.get("solver_mode", "assist")
 
         self._apply_fonts()
 
@@ -225,6 +226,7 @@ class App:
         prev_cell_size = self.cell_size
         self.move_delay = self.cfg.get("move_delay", self.move_delay)
         self.max_no_action = self.cfg.get("max_no_action_retries", self.max_no_action)
+        self.solver_mode = self.cfg.get("solver_mode", self.solver_mode)
         self.cell_size = self.cfg.get("cell_size", self.cell_size)
         if self.cell_size != prev_cell_size and self.game is not None:
             self._draw_board()
@@ -398,6 +400,7 @@ class App:
             max_no_action=self.max_no_action,
             stop_check=lambda: not self.running,
             system_prompt=SYSTEM_PROMPT,
+            solver_mode=self.solver_mode,
         )
 
     def _put(self, kind, payload):

@@ -189,6 +189,56 @@ class TestAutoFlag(unittest.TestCase):
         g = Minesweeper.from_preset("beginner", seed=1)
         self.assertEqual(g.auto_flag_certain_mines(), [])
 
+    def test_auto_flag_ignores_llm_guess_flags(self):
+        # A manual (LLM) flag is a guess: it must not seed new deductions.
+        g = Minesweeper(4, 4, 1, seed=2)
+        g.reveal(0, 0)
+        # Flag a hidden safe cell "by hand".
+        safe_hidden = next(
+            (r, c) for r in range(g.height) for c in range(g.width)
+            if not g.revealed[r][c] and not g.mines[r][c])
+        g.toggle_flag(*safe_hidden)
+        self.assertNotIn(safe_hidden, g.certain_flags)
+        # Auto-flag deductions still only flag genuine mines.
+        for (r, c) in g.auto_flag_certain_mines():
+            self.assertTrue(g.mines[r][c])
+
+
+class TestAutoChord(unittest.TestCase):
+    def test_chords_certain_safe_cells(self):
+        g = Minesweeper(4, 4, 1, seed=2)
+        g.reveal(0, 0)
+        before = g.revealed_count
+        g.auto_flag_certain_mines()
+        chorded = g.auto_chord_certain_safe()
+        self.assertTrue(chorded)
+        self.assertGreater(g.revealed_count, before)
+        self.assertNotEqual(g.state, "lost")
+
+    def test_wrong_llm_flag_never_auto_chorded(self):
+        # Regression guard: a wrong manual flag satisfies flagged==number on
+        # paper, but the auto-chord must refuse to trust it (never explode).
+        g = Minesweeper(4, 4, 2, seed=5)
+        g.reveal(0, 0)
+        safe_hidden = next(
+            (r, c) for r in range(g.height) for c in range(g.width)
+            if not g.revealed[r][c] and not g.mines[r][c])
+        g.toggle_flag(*safe_hidden)  # wrong flag on a safe cell
+        g.auto_chord_certain_safe()
+        self.assertNotEqual(g.state, "lost")
+
+    def test_solver_fixpoint_can_win_small_board(self):
+        # 1 mine on 4x4: flag + chord deduction should finish the game
+        # with zero guesses.
+        g = Minesweeper(4, 4, 1, seed=2)
+        g.reveal(0, 0)
+        for _ in range(10):
+            f = g.auto_flag_certain_mines()
+            c = g.auto_chord_certain_safe()
+            if not f and not c:
+                break
+        self.assertEqual(g.state, "won")
+
 
 class TestSeeding(unittest.TestCase):
     def test_same_seed_same_mines(self):
