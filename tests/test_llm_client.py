@@ -1,4 +1,4 @@
-"""Unit tests for llm_client formatting, chunk detection, and history trimming.
+"""Unit tests for llm_client init, chunk detection, and stream parsing.
 
 Network calls are mocked locally (no real HTTP), focusing on parsing logic.
 """
@@ -42,28 +42,6 @@ class TestInit(unittest.TestCase):
         self.assertEqual(c2.api_base_url, "https://x.com/v1")
 
 
-class TestAssistantMessageBuilder(unittest.TestCase):
-    def test_content_only(self):
-        m = LLMClient._build_openai_assistant_message(content="hi")
-        self.assertEqual(m["content"], "hi")
-        self.assertNotIn("tool_calls", m)
-
-    def test_tool_calls_only(self):
-        tc = [{"id": "1", "type": "function",
-               "function": {"name": "reveal", "arguments": "{}"}}]
-        m = LLMClient._build_openai_assistant_message(tool_calls=tc)
-        self.assertEqual(m["tool_calls"], tc)
-        self.assertNotIn("content", m)
-
-    def test_empty_falls_back_to_reasoning(self):
-        m = LLMClient._build_openai_assistant_message(reasoning="  ")
-        self.assertEqual(m["content"], "(no assistant content)")
-
-    def test_empty_with_reasoning_uses_it(self):
-        m = LLMClient._build_openai_assistant_message(reasoning="think")
-        self.assertEqual(m["content"], "think")
-
-
 class TestIsOpenAIChunk(unittest.TestCase):
     def test_classic_object_field(self):
         evt = {"object": "chat.completion.chunk", "choices": [{"delta": {}}]}
@@ -79,53 +57,6 @@ class TestIsOpenAIChunk(unittest.TestCase):
 
     def test_non_dict_rejected(self):
         self.assertFalse(LLMClient._is_openai_chunk("data"))
-
-
-class TestTrimHistory(unittest.TestCase):
-    def _openai_history(self):
-        # system, then pairs of user/assistant(+tool)
-        h = [{"role": "system", "content": "s"}]
-        for i in range(10):
-            h.append({"role": "user", "content": f"u{i}"})
-            h.append({"role": "assistant", "content": f"a{i}",
-                      "tool_calls": [{"id": str(i), "type": "function",
-                                      "function": {"name": "reveal",
-                                                   "arguments": "{}"}}]})
-            h.append({"role": "tool", "tool_call_id": str(i), "content": "ok"})
-        return h
-
-    def test_keeps_window(self):
-        c = make_client()
-        c.history = self._openai_history()
-        c.trim_history(3)
-        # system + last keep_turns*2=6 messages (2 turns)
-        self.assertEqual(len(c.history), 1 + 3 * 2)
-        self.assertEqual(c.history[0]["role"], "system")
-
-    def test_drops_leading_tool(self):
-        c = make_client()
-        h = self._openai_history()
-        # prepend a dangling tool with no matching assistant
-        h.insert(1, {"role": "tool", "tool_call_id": "x", "content": "orphan"})
-        c.history = h
-        c.trim_history(10)
-        self.assertNotEqual(c.history[1]["role"], "tool")
-
-    def test_drops_leading_assistant_with_orphan_tool_calls(self):
-        c = make_client()
-        h = self._openai_history()
-        # Replace the first retained assistant so its tool_calls have no following tool.
-        orphan_assistant = {"role": "assistant", "content": "a",
-                            "tool_calls": [{"id": "zz", "type": "function",
-                                            "function": {"name": "reveal",
-                                                         "arguments": "{}"}}]}
-        h = [{"role": "system", "content": "s"}, orphan_assistant,
-              {"role": "user", "content": "u"}]
-        c.history = h
-        c.trim_history(1)
-        # The orphan assistant (with tool_calls but no tool result) must be dropped.
-        self.assertNotIn("tool_calls",
-                         [m for m in c.history if m.get("role") == "assistant"])
 
 
 class TestStatelessStreamParse(unittest.TestCase):

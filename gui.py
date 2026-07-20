@@ -28,7 +28,7 @@ from minesweeper import Minesweeper, DIFFICULTIES, NUMBER_COLORS
 from llm_client import LLMClient, LLMError
 from run_history import record as record_run, summarize as summarize_runs
 from game_driver import (
-    SYSTEM_PROMPT, load_config, _format_tool_result, run_stateless_loop,
+    SYSTEM_PROMPT, load_config, run_stateless_loop,
 )
 
 UI_FONT_SIZE = 14
@@ -42,7 +42,6 @@ class App:
         self.cfg = load_config()
         self.cell_size = self.cfg.get("cell_size", 32)
         self.move_delay = self.cfg.get("move_delay", 0.6)
-        self.keep_recent = self.cfg.get("keep_recent_turns", 30)
         self.max_no_action = self.cfg.get("max_no_action_retries", 10)
 
         self._apply_fonts()
@@ -141,10 +140,6 @@ class App:
         except LLMError as e:
             messagebox.showerror("配置错误", str(e))
             return
-        # still init history for stateful fallback (continue button)
-        self.client.reset(SYSTEM_PROMPT + "\n\n当前难度: " + self.difficulty_var.get() +
-                           f"\n棋盘尺寸: {self.game.width}x{self.game.height}, " +
-                           f"雷数: {self.game.num_mines}")
         self.game_start_ts = time.time()
         self.game_recorded = False
 
@@ -154,27 +149,19 @@ class App:
                           f"(无状态模式) ===\n", tag="sys")
         self._draw_board()
         self._update_status()
-        self._begin_worker(stateless=True)
+        self._begin_worker()
 
     def on_continue(self):
         if self.running:
             return
         if self.game is None or self.game.state in ("won", "lost", "ready") or self.client is None:
             return
-        # The stateful path keeps conversation history, but on_start reset it
-        # to just the system prompt -- so a bare "继续" had no context of
-        # the current board. Re-feed the live board snapshot as the first
-        # user turn so the model actually continues this game.
-        snapshot = (
-            "继续当前对局。以下是当前棋盘状态(row/col 从0开始, '.' 未翻开, "
-            "'F' 旗, 数字为已翻开雷数):\n" + self.game.to_text()
-            + "\n" + self.game.summary()
-        )
-        self.client.history.append({"role": "user", "content": snapshot})
-        self._append_text("\n[继续(有状态模式), 已载入当前棋盘]\n", tag="sys")
-        self._begin_worker(stateless=False)
+        # The loop is stateless: resuming just means re-entering it with the
+        # live game object -- the next snapshot carries the full board.
+        self._append_text("\n[继续, 从当前棋盘恢复]\n", tag="sys")
+        self._begin_worker()
 
-    def _begin_worker(self, stateless=True):
+    def _begin_worker(self):
         self.running = True
         self.start_btn.config(state=tk.DISABLED)
         self.continue_btn.config(state=tk.DISABLED)
@@ -184,8 +171,7 @@ class App:
                 self.cmd_queue.get_nowait()
             except queue.Empty:
                 break
-        target = self._run_loop_stateless if stateless else self._run_loop_stateful
-        self.worker = threading.Thread(target=target, daemon=True)
+        self.worker = threading.Thread(target=self._run_loop_stateless, daemon=True)
         self.worker.start()
         self.root.after(100, self._poll_queue)
 
@@ -238,7 +224,6 @@ class App:
         # needs a redraw so the new board sizing takes effect.
         prev_cell_size = self.cell_size
         self.move_delay = self.cfg.get("move_delay", self.move_delay)
-        self.keep_recent = self.cfg.get("keep_recent_turns", self.keep_recent)
         self.max_no_action = self.cfg.get("max_no_action_retries", self.max_no_action)
         self.cell_size = self.cfg.get("cell_size", self.cell_size)
         if self.cell_size != prev_cell_size and self.game is not None:
@@ -414,127 +399,6 @@ class App:
             stop_check=lambda: not self.running,
             system_prompt=SYSTEM_PROMPT,
         )
-
-    def _run_loop_stateful(self):
-        no_action = 0
-        while self.running:
-            g = self.game
-            if g.state in ("won", "lost"):
-                self._put("end", None)
-                return
-            remaining = max(self.max_no_action - no_action, 1)
-            urgency = (
-                f"\n\n运行约束: 本轮必须调用且只调用一个工具。"
-                f"如果本轮不调用工具，将记为无动作；连续 {self.max_no_action} "
-                f"次无动作会自动停止本局。当前已连续无动作 {no_action} 次，"
-                f"本轮再无动作前剩余机会 {remaining} 次。"
-                "请用简体中文简短说明，然后立即调用 reveal / toggle_flag / chord。"
-            )
-            snapshot = (
-                "当前棋盘（row 为行，col 为列；从0开始；'.' 未翻开, 'F' 旗, 数字为已翻开雷数）:\n"
-                + g.to_text() + "\n" + g.summary() + urgency
-            )
-            self._put("think_start", None)
-            thinking = ""
-            tool_calls = []
-            try:
-                for kind, val in self.client.turn_stream(snapshot):
-                    if not self.running:
-                        self._put("think_end", None)
-                        return
-                    if kind == "chunk":
-                        self._put("think_chunk", val)
-                        thinking += val
-                    elif kind == "final":
-                        thinking = val.get("thinking", thinking)
-                        tool_calls = val.get("tool_calls") or []
-            except LLMError as e:
-                self._put("think_end", True)
-                self._put("error", f"[LLM 调用失败] {e}")
-                self._put("end", None)
-                return
-            self._put("think_end", True)
-            # newline after the streamed thinking block
-            self._put("think_chunk", "\n")
-
-            if not tool_calls:
-                no_action += 1
-                self._put(
-                    "result",
-                    f"[模型未执行任何工具调用] 连续无动作 {no_action}/{self.max_no_action}",
-                )
-                if no_action >= self.max_no_action:
-                    self._put("error", "连续多次未执行动作，自动停止。")
-                    self._put("end", None)
-                    return
-                continue
-            no_action = 0
-            for tc in tool_calls:
-                if not self.running:
-                    return
-                name = tc.get("name")
-                args = tc.get("args") or {}
-                row = args.get("row")
-                col = args.get("col")
-                if row is None or col is None:
-                    self.client.add_tool_result(tc.get("id"), name or "unknown",
-                                               "错误: 缺少 row 或 col 参数。")
-                    self._put("result", "[跳过: 缺少参数]")
-                    continue
-                self._put("action", f">>> {name}(row={row}, col={col})")
-                if name == "reveal":
-                    out = g.reveal(row, col)
-                    # auto-flag determined mines after a reveal
-                    autoflags = g.auto_flag_certain_mines()
-                elif name == "toggle_flag":
-                    out = g.toggle_flag(row, col)
-                    autoflags = []
-                elif name == "chord":
-                    out = g.chord(row, col)
-                    # A successful chord can expose new numbered cells, which
-                    # may in turn make additional mines certain.
-                    autoflags = g.auto_flag_certain_mines()
-                else:
-                    out = {"result": "invalid", "message": f"未知函数: {name}"}
-                    autoflags = []
-                self._put("redraw", None)
-                self._put("result", _format_tool_result(out, name, row, col))
-                if autoflags:
-                    cell_strs = ", ".join(f"({r},{c})" for r, c in autoflags)
-                    self._put("result", f"  [自动插旗] {len(autoflags)} 格: {cell_strs}")
-                self.client.add_tool_result(
-                    tc.get("id"), name,
-                    self._tool_result_to_llm(out, name, row, col, autoflags))
-                if g.state in ("won", "lost"):
-                    self._put("end", None)
-                    return
-                self.client.trim_history(self.keep_recent)
-                time.sleep(self.move_delay)
-    def _tool_result_to_llm(out, name, row, col, autoflags=None):
-        autoflags = autoflags or []
-        extra = ""
-        if autoflags:
-            extra = f" 程序已为 {len(autoflags)} 个确定雷格自动插旗(见快照中的 'F')。"
-        r = out.get("result")
-        if r == "safe":
-            verb = "双击" if name == "chord" else "翻开"
-            return (f"{name}({row},{col}) 成功。{verb}后新打开了 "
-                    f"{len(out.get('cells',[]))} 个格，棋盘已更新(见下次给你的快照)。"
-                    + extra)
-        if r == "mine":
-            cell = out.get("cell", (row, col))
-            return f"{name}({row},{col}) 触发了地雷 {cell}, 你输了这局。"
-        if r == "won":
-            return f"{name}({row},{col}) 之后你已胜利(翻开全部安全格)。"
-        if r == "flag":
-            return f"toggle_flag({row},{col}) 已标记为旗。"
-        if r == "unflag":
-            return f"toggle_flag({row},{col}) 已取消旗。"
-        if r == "nochange":
-            return f"{name}({row},{col}) 无变化: {out.get('message','')}"
-        if r == "invalid":
-            return f"{name}({row},{col}) 无效: {out.get('message','')}"
-        return str(out)
 
     def _put(self, kind, payload):
         self.cmd_queue.put((kind, payload))

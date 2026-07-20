@@ -1,5 +1,6 @@
 """LLM client supporting OpenAI-compatible and Anthropic message formats with
-tool calling. Conversation history is kept in each provider's native format.
+tool calling. Stateless only: every call is built fresh from
+(system_prompt, board_snapshot); no conversation history is kept client-side.
 """
 import json
 from urllib.parse import urlparse
@@ -115,8 +116,6 @@ class LLMClient:
         self.tool_choice = config.get("tool_choice", "required")
         self.omit_tool_choice = self._should_omit_tool_choice(config)
         self.tool_temperature = config.get("tool_temperature")
-        self.system_prompt = ""
-        self.history = []  # native-format message list
         if self.provider not in ("openai", "anthropic"):
             raise LLMError(f"不支持的 provider: {self.provider}")
         if not self.api_base_url:
@@ -124,48 +123,14 @@ class LLMClient:
         if not self.api_key or self.api_key == "YOUR_API_KEY_HERE":
             raise LLMError("api_key 未配置 (请在 llm_config.json 中填入你的密钥)")
 
-    def reset(self, system_prompt):
-        self.system_prompt = system_prompt
-        if self.provider == "anthropic":
-            self.history = []
-        else:
-            self.history = [{"role": "system", "content": system_prompt}]
-
-    # ---- main entry: do one model call with current history ----
-    def turn(self, user_text):
-        """Append a user message, call the model, return assistant content + tool calls.
-
-        Returns dict:
-          thinking: str  (reasoning text to display)
-          tool_calls: list of {"id","name","args":dict}
-          has_action: bool
-        The assistant message is appended to history by the caller? No:
-        we append the assistant message inside, tool results added later by
-        add_tool_result.
-        """
-        if self.provider == "openai":
-            return self._turn_openai(user_text)
-        return self._turn_anthropic(user_text)
-
-    def turn_stream(self, user_text):
-        """Streaming version of turn(). Generator yielding incremental
-        thinking text then a final result.
-
-        Yields tuples:
-          ("chunk", text_fragment)  -- incremental thinking text
-          ("final", result_dict)    -- result_dict == turn()'s return
-        """
-        if self.provider == "openai":
-            yield from self._turn_openai_stream(user_text)
-        else:
-            yield from self._turn_anthropic_stream(user_text)
-
     def call_stateless_stream(self, system_text, board_text):
         """Streaming call with NO history involvement.
 
-        Returns fresh messages=[system+user] each call; does not read or
-        mutate self.history. Yields the same ("chunk"/"final") 2-tuples
-        as turn_stream.
+        Builds fresh messages=[system+user] for every call. Yields
+        ("chunk", text_fragment) tuples for incremental thinking text and a
+        single ("final", {"thinking", "tool_calls", "usage"}) tuple at the
+        end. ``usage`` is {"input_tokens", "output_tokens"} or None when the
+        server did not report it.
         """
         if self.provider == "openai":
             yield from self._stateless_openai_stream(system_text, board_text)
@@ -191,51 +156,11 @@ class LLMClient:
             body["tool_temperature"] = self.tool_temperature
         return body
 
-    def _turn_openai(self, user_text):
-        self.history.append({"role": "user", "content": user_text})
-        body = self._build_openai_body(self.history)
-        data = self._post(f"{self.api_base_url}/chat/completions",
-                          headers={"Authorization": f"Bearer {self.api_key}"},
-                          body=body)
-        msg = data["choices"][0]["message"]
-        thinking_parts = []
-        if msg.get("reasoning_content"):
-            thinking_parts.append(msg["reasoning_content"])
-        if msg.get("content"):
-            thinking_parts.append(msg["content"])
-        thinking = "\n".join(thinking_parts).strip()
-
-        tool_calls = []
-        for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function", {})
-            try:
-                args = json.loads(fn.get("arguments", "{}") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            tool_calls.append({"id": tc.get("id"), "name": fn.get("name"), "args": args})
-
-        # Append an assistant message that remains valid for strict
-        # OpenAI-compatible servers such as DeepSeek. Reasoning models can
-        # return only reasoning_content and no tool call; replaying that as an
-        # empty assistant message makes the next request fail with:
-        # "content or tool_calls must be set".
-        assistant_msg = self._build_openai_assistant_message(
-            content=msg.get("content"),
-            reasoning=msg.get("reasoning_content"),
-            tool_calls=msg.get("tool_calls"),
-        )
-        self.history.append(assistant_msg)
-        return {"thinking": thinking, "tool_calls": tool_calls}
-
     # ---------- shared streaming parsers ----------
-    # Both OpenAI-style streamers below share one parser; both Anthropic-style
-    # streamers share another. Each generator yields incremental thinking
-    # text as ("chunk", fragment) and finishes with a single
-    # ("final", {"thinking": ..., "tool_calls": [...]}) tuple. When
-    # `record` is True the resulting assistant message is also appended to
-    # self.history (the stateful path); the stateless path leaves history
-    # untouched.
-    def _parse_openai_stream(self, resp, record=False):
+    # Both providers share one parser each. Each generator yields incremental
+    # thinking text as ("chunk", fragment) and finishes with a single
+    # ("final", {"thinking", "tool_calls", "usage"}) tuple.
+    def _parse_openai_stream(self, resp):
         content_parts = []
         reasoning_parts = []
         tool_calls_acc = {}  # index -> dict
@@ -277,7 +202,6 @@ class LLMClient:
             thinking_parts.append(content)
         thinking = "\n".join(thinking_parts).strip()
         built_tcs = []
-        raw_tcs = []
         for idx in sorted(tool_calls_acc.keys()):
             slot = tool_calls_acc[idx]
             try:
@@ -285,17 +209,10 @@ class LLMClient:
             except json.JSONDecodeError:
                 args = {}
             built_tcs.append({"id": slot["id"], "name": slot["name"], "args": args})
-            raw_tcs.append({
-                "id": slot["id"], "type": "function",
-                "function": {"name": slot["name"], "arguments": slot["arguments"]},
-            })
-        if record:
-            self.history.append(self._build_openai_assistant_message(
-                content=content, reasoning=reasoning, tool_calls=raw_tcs))
         yield ("final", {"thinking": thinking, "tool_calls": built_tcs,
                          "usage": _norm_openai_usage(usage)})
 
-    def _parse_anthropic_stream(self, resp, record=False):
+    def _parse_anthropic_stream(self, resp):
         content_blocks = []
         thinking_parts = []
         usage_in = None
@@ -350,25 +267,11 @@ class LLMClient:
                     "id": block.get("id"), "name": block.get("name"), "args": args,
                 })
         thinking = "\n".join(p for p in thinking_parts if p).strip()
-        if record:
-            self.history.append({"role": "assistant", "content": content_blocks})
         usage = None
         if usage_in is not None or usage_out is not None:
             usage = {"input_tokens": usage_in, "output_tokens": usage_out}
         yield ("final", {"thinking": thinking, "tool_calls": built_tcs,
                          "usage": usage})
-
-    @staticmethod
-    def _build_openai_assistant_message(content=None, reasoning=None, tool_calls=None):
-        assistant_msg = {"role": "assistant"}
-        if content:
-            assistant_msg["content"] = content
-        if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
-        if "content" not in assistant_msg and "tool_calls" not in assistant_msg:
-            fallback = (reasoning or "").strip()
-            assistant_msg["content"] = fallback or "(no assistant content)"
-        return assistant_msg
 
     def _should_omit_tool_choice(self, config):
         """Compatibility switch for OpenAI-compatible servers.
@@ -410,15 +313,7 @@ class LLMClient:
         delta = choices[0].get("delta")
         return isinstance(delta, dict)
 
-    # ---------- OpenAI format (streaming) ----------
-    def _turn_openai_stream(self, user_text):
-        self.history.append({"role": "user", "content": user_text})
-        body = self._build_openai_body(self.history, stream=True)
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        resp = self._post_stream(f"{self.api_base_url}/chat/completions",
-                                 headers=headers, body=body)
-        yield from self._parse_openai_stream(resp, record=True)
-
+    # ---------- stateless provider calls ----------
     def _stateless_openai_stream(self, system_text, board_text):
         messages = [
             {"role": "system", "content": system_text},
@@ -428,7 +323,7 @@ class LLMClient:
         headers = {"Authorization": f"Bearer {self.api_key}"}
         resp = self._post_stream(f"{self.api_base_url}/chat/completions",
                                  headers=headers, body=body)
-        yield from self._parse_openai_stream(resp, record=False)
+        yield from self._parse_openai_stream(resp)
 
     def _stateless_anthropic_stream(self, system_text, board_text):
         body = {
@@ -446,135 +341,9 @@ class LLMClient:
             headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
             body=body,
         )
-        yield from self._parse_anthropic_stream(resp, record=False)
-    # ---------- Anthropic format ----------
-    def _turn_anthropic(self, user_text):
-        self.history.append({"role": "user", "content": user_text})
-        body = {
-            "model": self.model,
-            "system": self.system_prompt,
-            "messages": self.history,
-            "tools": build_anthropic_tools(),
-            "tool_choice": {"type": "any" if self.tool_choice == "required" else "auto"},
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
-        data = self._post(
-            f"{self.api_base_url}/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            body=body,
-        )
-        content_blocks = data.get("content", [])
-        thinking_parts = []
-        tool_calls = []
-        for block in content_blocks:
-            if block.get("type") == "text":
-                thinking_parts.append(block.get("text", ""))
-            elif block.get("type") == "thinking":
-                thinking_parts.append(block.get("thinking", ""))
-            elif block.get("type") == "tool_use":
-                tool_calls.append({
-                    "id": block.get("id"),
-                    "name": block.get("name"),
-                    "args": block.get("input", {}) or {},
-                })
-        thinking = "\n".join(p for p in thinking_parts if p).strip()
-        # append assistant message (raw content list keeps tool_use ids intact)
-        self.history.append({"role": "assistant", "content": content_blocks})
-        return {"thinking": thinking, "tool_calls": tool_calls}
-
-    def _turn_anthropic_stream(self, user_text):
-        self.history.append({"role": "user", "content": user_text})
-        body = {
-            "model": self.model,
-            "system": self.system_prompt,
-            "messages": self.history,
-            "tools": build_anthropic_tools(),
-            "tool_choice": {"type": "any" if self.tool_choice == "required" else "auto"},
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": True,
-        }
-        resp = self._post_stream(
-            f"{self.api_base_url}/messages",
-            headers={"x-api-key": self.api_key,
-                     "anthropic-version": "2023-06-01"},
-            body=body,
-        )
-        yield from self._parse_anthropic_stream(resp, record=True)
-
-    # ---------- record a tool result ----------
-    def add_tool_result(self, tool_call_id, name, result_text):
-        if self.provider == "openai":
-            self.history.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id or "",
-                "name": name,
-                "content": result_text,
-            })
-        else:
-            self.history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id or "",
-                        "content": result_text,
-                    }
-                ],
-            })
-
-    def trim_history(self, keep_turns):
-        """Keep the first system/opening message(s) and the last keep_turns turn-pairs.
-
-        For the OpenAI provider, the retained window is also advanced to a
-        safe message boundary: it never starts with a `tool` result (no
-        matching assistant call) nor with an `assistant` message that still
-        carries `tool_calls` whose corresponding `tool` result was trimmed
-        off -- either case makes the next API request invalid.
-        """
-        if keep_turns is None or keep_turns <= 0:
-            return
-        if self.provider == "openai":
-            system = [self.history[0]] if self.history and self.history[0]["role"] == "system" else []
-            rest = self.history[len(system):]
-        else:
-            system = []
-            rest = self.history[:]
-        # keep the last keep_turns*2 messages (each turn = user+assistant(+tool result))
-        window = rest[-max(keep_turns * 2, 6):]
-        if self.provider == "openai":
-            # Drop leading tool results with no preceding assistant call.
-            while window and window[0].get("role") == "tool":
-                window = window[1:]
-            # Drop a leading assistant message whose tool_calls were cut off
-            # (i.e. no following tool result remains in the window).
-            while window and window[0].get("role") == "assistant" and window[0].get("tool_calls"):
-                if not any(m.get("role") == "tool" for m in window[1:]):
-                    window = window[1:]
-                else:
-                    break
-        self.history = system + window
+        yield from self._parse_anthropic_stream(resp)
 
     # ---------- low level ----------
-    def _post(self, url, headers, body):
-        headers = dict(headers)
-        headers.setdefault("content-type", "application/json")
-        try:
-            resp = requests.post(url, headers=headers, json=body, timeout=self.timeout)
-        except requests.RequestException as e:
-            raise LLMError(f"网络请求失败: {e}") from e
-        if resp.status_code >= 400:
-            raise LLMError(f"API 返回错误 {resp.status_code}: {resp.text[:500]}")
-        try:
-            return resp.json()
-        except ValueError:
-            raise LLMError(f"API 返回非 JSON 响应: {resp.text[:500]}")
-
     def _post_stream(self, url, headers, body):
         """POST with stream=True; generator yielding decoded JSON event dicts.
         Each line is `data: {json}` -> parsed dict.  Empty/comments ignored.
